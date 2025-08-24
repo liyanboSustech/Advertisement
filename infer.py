@@ -9,8 +9,8 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import MyTestDataset, save_emb
-from model import BaselineModel
+from dataset_former import MyTestDataset, save_emb
+from model_former import BaselineModel
 
 
 def get_ckpt_path():
