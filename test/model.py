@@ -196,6 +196,7 @@ class BaselineModel(torch.nn.Module):
     def forward(self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feat, pos_feat, neg_feat):
         log_feats = self.log2feats(user_item, mask, seq_feat)
         loss_mask = (next_mask == 1).to(self.dev)
+<<<<<<< HEAD
         pos_embs = self.feat2emb(pos_seqs, pos_feat, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feat, include_user=False)
         return log_feats, pos_embs, neg_embs, loss_mask
@@ -219,6 +220,43 @@ class BaselineModel(torch.nn.Module):
         
         loss = F.cross_entropy(masked_logits, labels)
         return loss
+=======
+
+        pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
+        neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
+
+        # Get the last non-padded token for sequence embeddings
+        seq_lens = (user_item != 0).sum(dim=1) - 1  # Get last valid index
+        batch_size = user_item.size(0)
+        seq_embs = log_feats[torch.arange(batch_size), seq_lens]
+        
+        # Get corresponding positive and negative embeddings
+        pos_embs = pos_embs[torch.arange(batch_size), seq_lens]
+        neg_embs = neg_embs[torch.arange(batch_size), seq_lens]
+
+        return seq_embs, pos_embs, neg_embs, loss_mask
+
+    def predict(self, log_seqs, seq_feature, mask):
+        """
+        计算用户序列的表征
+        Args:
+            log_seqs: 用户序列ID
+            seq_feature: 序列特征list，每个元素为当前时刻的特征字典
+            mask: token类型掩码，1表示item token，2表示user token
+        Returns:
+            final_feat: 用户序列的表征，形状为 [batch_size, hidden_units]
+        """
+        log_feats = self.log2feats(log_seqs, mask, seq_feature)
+
+        final_feat = log_feats[:, -1, :]
+
+        # L2 normalization to maintain consistency with training
+        final_feat = final_feat / final_feat.norm(dim=-1, keepdim=True)
+
+        return final_feat
+
+
+>>>>>>> 28df5a1 (update)
 
     def predict(self, log_seqs, seq_feature, mask):
         log_feats = self.log2feats(log_seqs, mask, seq_feature)
