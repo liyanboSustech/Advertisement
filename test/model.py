@@ -1,130 +1,182 @@
-"""
-HSTU模型实现
-基于Meta的生成式推荐系统中的HSTU架构
-适配现有代码框架和特征处理
-"""
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from pathlib import Path
 
 from dataset import save_emb
-from hstu_components import (
-    LocalEmbeddingModule,
-    LearnablePositionalEmbeddingInputFeaturesPreprocessor,
-    L2NormEmbeddingPostprocessor,
-)
-from simplified_hstu import HSTU
-from dot_product_similarity import DotProductSimilarity
 
 
-class HSTUModel(torch.nn.Module):
+class FlashMultiHeadAttention(torch.nn.Module):
+    def __init__(self, hidden_units, num_heads, dropout_rate):
+        super(FlashMultiHeadAttention, self).__init__()
+
+        self.hidden_units = hidden_units
+        self.num_heads = num_heads
+        self.head_dim = hidden_units // num_heads
+        self.dropout_rate = dropout_rate
+
+        assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
+
+        self.q_linear = torch.nn.Linear(hidden_units, hidden_units)
+        self.k_linear = torch.nn.Linear(hidden_units, hidden_units)
+        self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
+        self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
+
+    def forward(self, query, key, value, attn_mask=None):
+        batch_size, seq_len, _ = query.size()
+
+        # 计算Q, K, V
+        Q = self.q_linear(query)
+        K = self.k_linear(key)
+        V = self.v_linear(value)
+
+        # reshape为multi-head格式
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if hasattr(F, 'scaled_dot_product_attention'):
+            # PyTorch 2.0+ 使用内置的Flash Attention
+            attn_output = F.scaled_dot_product_attention(
+                Q, K, V, dropout_p=self.dropout_rate if self.training else 0.0, attn_mask=attn_mask.unsqueeze(1)
+            )
+        else:
+            # 降级到标准注意力机制
+            scale = (self.head_dim) ** -0.5
+            scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
+
+            if attn_mask is not None:
+                scores.masked_fill_(attn_mask.unsqueeze(1).logical_not(), float('-inf'))
+
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = F.dropout(attn_weights, p=self.dropout_rate, training=self.training)
+            attn_output = torch.matmul(attn_weights, V)
+
+        # reshape回原来的格式
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
+
+        # 最终的线性变换
+        output = self.out_linear(attn_output)
+
+        return output, None
+
+
+class PointWiseFeedForward(torch.nn.Module):
+    def __init__(self, hidden_units, dropout_rate):
+        super(PointWiseFeedForward, self).__init__()
+
+        self.conv1 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
+        self.dropout1 = torch.nn.Dropout(p=dropout_rate)
+        self.relu = torch.nn.ReLU()
+        self.conv2 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
+        self.dropout2 = torch.nn.Dropout(p=dropout_rate)
+
+    def forward(self, inputs):
+        outputs = self.dropout2(self.conv2(self.relu(self.dropout1(self.conv1(inputs.transpose(-1, -2))))))
+        outputs = outputs.transpose(-1, -2)  # as Conv1D requires (N, C, Length)
+        return outputs
+
+
+class BaselineModel(torch.nn.Module):
     """
-    HSTU (Hierarchical Sequential Transduction Unit) 模型
-    
-    适配现有代码架构的HSTU实现，支持：
-    - 多种特征类型处理（稀疏、数组、连续、嵌入特征）
-    - InfoNCE损失函数
-    - 序列编码和预测
-    - 候选库嵌入生成
-    
     Args:
         user_num: 用户数量
         item_num: 物品数量
-        feat_statistics: 特征统计信息
-        feat_types: 特征类型分类
-        args: 训练参数
+        feat_statistics: 特征统计信息，key为特征ID，value为特征数量
+        feat_types: 各个特征的特征类型，key为特征类型名称，value为包含的特征ID列表，包括user和item的sparse, array, emb, continual类型
+        args: 全局参数
+
+    Attributes:
+        user_num: 用户数量
+        item_num: 物品数量
+        dev: 设备
+        norm_first: 是否先归一化
+        maxlen: 序列最大长度
+        item_emb: Item Embedding Table
+        user_emb: User Embedding Table
+        sparse_emb: 稀疏特征Embedding Table
+        emb_transform: 多模态特征的线性变换
+        userdnn: 用户特征拼接后经过的全连接层
+        itemdnn: 物品特征拼接后经过的全连接层
     """
 
-    def __init__(self, user_num, item_num, feat_statistics, feat_types, args):
-        super(HSTUModel, self).__init__()
+    def __init__(self, user_num, item_num, feat_statistics, feat_types, args):  #
+        super(BaselineModel, self).__init__()
 
         self.user_num = user_num
         self.item_num = item_num
         self.dev = args.device
+        self.norm_first = args.norm_first
         self.maxlen = args.maxlen
-        self.temperature = getattr(args, 'infonce_temp', 0.1)
-        
-        # HSTU特定参数
-        self.num_blocks = getattr(args, 'num_blocks', 2)
-        self.num_heads = getattr(args, 'num_heads', 1)
-        self.attention_dim = getattr(args, 'attention_dim', 64)
-        self.linear_dim = getattr(args, 'linear_dim', 64)
-        self.dropout_rate = getattr(args, 'dropout_rate', 0.2)
-        
-        # 初始化特征信息
-        self._init_feat_info(feat_statistics, feat_types)
-        
-        # 创建HSTU嵌入模块
-        self.embedding_module = LocalEmbeddingModule(
-            num_items=item_num,
-            item_embedding_dim=args.hidden_units,
-        )
-        
-        # 创建输入特征预处理器
-        self.input_preprocessor = LearnablePositionalEmbeddingInputFeaturesPreprocessor(
-            max_sequence_len=args.maxlen,
-            embedding_dim=args.hidden_units,
-            dropout_rate=self.dropout_rate,
-        )
-        
-        # 创建输出后处理器
-        self.output_postprocessor = L2NormEmbeddingPostprocessor(
-            embedding_dim=args.hidden_units,
-        )
-        
-        # 创建相似度模块
-        self.similarity_module = DotProductSimilarity()
-        
-        # 创建HSTU模型
-        self.hstu = HSTU(
-            max_sequence_len=args.maxlen,
-            max_output_len=1,
-            embedding_dim=args.hidden_units,
-            num_blocks=self.num_blocks,
-            num_heads=self.num_heads,
-            attention_dim=self.attention_dim,
-            linear_dim=self.linear_dim,
-            linear_dropout_rate=self.dropout_rate,
-            attn_dropout_rate=self.dropout_rate,
-            embedding_module=self.embedding_module,
-            similarity_module=self.similarity_module,
-            input_features_preproc_module=self.input_preprocessor,
-            output_postproc_module=self.output_postprocessor,
-            enable_relative_attention_bias=True,
-            verbose=False,
-        )
-        
-        # 特征处理模块（处理额外特征）
+        self.temp = getattr(args, 'temp', 0.1)  # InfoNCE temperature parameter
+        self.writer = None  # TensorBoard writer, will be set during training
+        # TODO: loss += args.l2_emb for regularizing embedding vectors during training
+        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
+
+        self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
+        self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
+        self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
+        self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
         self.sparse_emb = torch.nn.ModuleDict()
         self.emb_transform = torch.nn.ModuleDict()
-        
-        # 初始化特征嵌入
+
+        self.attention_layernorms = torch.nn.ModuleList()  # to be Q for self-attention
+        self.attention_layers = torch.nn.ModuleList()
+        self.forward_layernorms = torch.nn.ModuleList()
+        self.forward_layers = torch.nn.ModuleList()
+
+        self._init_feat_info(feat_statistics, feat_types)
+
+        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
+            self.USER_CONTINUAL_FEAT
+        )
+        itemdim = (
+            args.hidden_units * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
+            + len(self.ITEM_CONTINUAL_FEAT)
+            + args.hidden_units * len(self.ITEM_EMB_FEAT)
+        )
+
+        self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
+        self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
+
+        self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+
+        for _ in range(args.num_blocks):
+            new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+            self.attention_layernorms.append(new_attn_layernorm)
+
+            new_attn_layer = FlashMultiHeadAttention(
+                args.hidden_units, args.num_heads, args.dropout_rate
+            )  # 优化：用FlashAttention替代标准Attention
+            self.attention_layers.append(new_attn_layer)
+
+            new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+            self.forward_layernorms.append(new_fwd_layernorm)
+
+            new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
+            self.forward_layers.append(new_fwd_layer)
+
         for k in self.USER_SPARSE_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(
-                self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0
-            )
+            self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_SPARSE_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(
-                self.ITEM_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0
-            )
+            self.sparse_emb[k] = torch.nn.Embedding(self.ITEM_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_ARRAY_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(
-                self.ITEM_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0
-            )
+            self.sparse_emb[k] = torch.nn.Embedding(self.ITEM_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.USER_ARRAY_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(
-                self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0
-            )
+            self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
-            self.emb_transform[k] = torch.nn.Linear(
-                self.ITEM_EMB_FEAT[k], args.hidden_units
-            )
+            self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
 
     def _init_feat_info(self, feat_statistics, feat_types):
-        """初始化特征信息"""
+        """
+        将特征统计信息（特征数量）按特征类型分组产生不同的字典，方便声明稀疏特征的Embedding Table
+
+        Args:
+            feat_statistics: 特征统计信息，key为特征ID，value为特征数量
+            feat_types: 各个特征的特征类型，key为特征类型名称，value为包含的特征ID列表，包括user和item的sparse, array, emb, continual类型
+        """
         self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['user_sparse']}
         self.USER_CONTINUAL_FEAT = feat_types['user_continual']
         self.ITEM_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['item_sparse']}
@@ -132,36 +184,73 @@ class HSTUModel(torch.nn.Module):
         self.USER_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['user_array']}
         self.ITEM_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['item_array']}
         EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
-        self.ITEM_EMB_FEAT = {k: EMB_SHAPE_DICT[k] for k in feat_types['item_emb']}
+        self.ITEM_EMB_FEAT = {k: EMB_SHAPE_DICT[k] for k in feat_types['item_emb']}  # 记录的是不同多模态特征的维度
 
-    def feat2emb(self, seq, feature_tensors, mask=None, include_user=False):
+    def feat2tensor(self, seq_feature, k):
         """
-        将特征转换为嵌入向量
-        
+        Args:
+            seq_feature: 序列特征list，每个元素为当前时刻的特征字典，形状为 [batch_size, maxlen]
+            k: 特征ID
+
+        Returns:
+            batch_data: 特征值的tensor，形状为 [batch_size, maxlen, max_array_len(if array)]
+        """
+        batch_size = len(seq_feature)
+
+        if k in self.ITEM_ARRAY_FEAT or k in self.USER_ARRAY_FEAT:
+            # 如果特征是Array类型，需要先对array进行padding，然后转换为tensor
+            max_array_len = 0
+            max_seq_len = 0
+
+            for i in range(batch_size):
+                seq_data = [item[k] for item in seq_feature[i]]
+                max_seq_len = max(max_seq_len, len(seq_data))
+                max_array_len = max(max_array_len, max(len(item_data) for item_data in seq_data))
+
+            batch_data = np.zeros((batch_size, max_seq_len, max_array_len), dtype=np.int64)
+            for i in range(batch_size):
+                seq_data = [item[k] for item in seq_feature[i]]
+                for j, item_data in enumerate(seq_data):
+                    actual_len = min(len(item_data), max_array_len)
+                    batch_data[i, j, :actual_len] = item_data[:actual_len]
+
+            return torch.from_numpy(batch_data).to(self.dev)
+        else:
+            # 如果特征是Sparse类型，直接转换为tensor
+            max_seq_len = max(len(seq_feature[i]) for i in range(batch_size))
+            batch_data = np.zeros((batch_size, max_seq_len), dtype=np.int64)
+
+            for i in range(batch_size):
+                seq_data = [item[k] for item in seq_feature[i]]
+                batch_data[i] = seq_data
+
+            return torch.from_numpy(batch_data).to(self.dev)
+
+    def feat2emb(self, seq, feature_array, mask=None, include_user=False):
+        """
         Args:
             seq: 序列ID
-            feature_tensors: 预处理的特征张量字典
-            mask: 掩码（1=item, 2=user）
-            include_user: 是否包含用户特征
-            
+            feature_array: 特征list，每个元素为当前时刻的特征字典
+            mask: 掩码，1表示item，2表示user
+            include_user: 是否处理用户特征，在两种情况下不打开：1) 训练时在转换正负样本的特征时（因为正负样本都是item）;2) 生成候选库item embedding时。
+
         Returns:
-            seqs_emb: 序列特征嵌入
+            seqs_emb: 序列特征的Embedding
         """
         seq = seq.to(self.dev)
-        
-        # 获取基础物品嵌入
-        item_embeddings = self.embedding_module.get_item_embeddings(seq)
-        
-        # 处理额外特征
-        item_feat_list = [item_embeddings]
-        user_feat_list = []
-        
+        # pre-compute embedding
         if include_user:
             user_mask = (mask == 2).to(self.dev)
-            user_embedding = self.embedding_module.get_item_embeddings(user_mask * seq)
+            item_mask = (mask == 1).to(self.dev)
+            user_embedding = self.user_emb(user_mask * seq)
+            item_embedding = self.item_emb(item_mask * seq)
+            item_feat_list = [item_embedding]
             user_feat_list = [user_embedding]
-        
-        # 批量处理所有特征类型
+        else:
+            item_embedding = self.item_emb(seq)
+            item_feat_list = [item_embedding]
+
+        # batch-process all feature types
         all_feat_types = [
             (self.ITEM_SPARSE_FEAT, 'item_sparse', item_feat_list),
             (self.ITEM_ARRAY_FEAT, 'item_array', item_feat_list),
@@ -169,191 +258,206 @@ class HSTUModel(torch.nn.Module):
         ]
 
         if include_user:
-            all_feat_types.extend([
-                (self.USER_SPARSE_FEAT, 'user_sparse', user_feat_list),
-                (self.USER_ARRAY_FEAT, 'user_array', user_feat_list),
-                (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list),
-            ])
+            all_feat_types.extend(
+                [
+                    (self.USER_SPARSE_FEAT, 'user_sparse', user_feat_list),
+                    (self.USER_ARRAY_FEAT, 'user_array', user_feat_list),
+                    (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list),
+                ]
+            )
 
-        # 处理每种特征类型
+        # batch-process each feature type
         for feat_dict, feat_type, feat_list in all_feat_types:
             if not feat_dict:
                 continue
 
             for k in feat_dict:
-                if k in feature_tensors:
-                    tensor_feature = feature_tensors[k].to(self.dev)
-                    
-                    if feat_type.endswith('sparse'):
-                        feat_list.append(self.sparse_emb[k](tensor_feature))
-                    elif feat_type.endswith('array'):
-                        feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
-                    elif feat_type.endswith('continual'):
-                        feat_list.append(tensor_feature.unsqueeze(2))
+                tensor_feature = self.feat2tensor(feature_array, k)
 
-        # 处理嵌入特征
+                if feat_type.endswith('sparse'):
+                    feat_list.append(self.sparse_emb[k](tensor_feature))
+                elif feat_type.endswith('array'):
+                    feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
+                elif feat_type.endswith('continual'):
+                    feat_list.append(tensor_feature.unsqueeze(2))
+
         for k in self.ITEM_EMB_FEAT:
-            if k in feature_tensors:
-                tensor_feature = feature_tensors[k].to(self.dev)
-                item_feat_list.append(self.emb_transform[k](tensor_feature))
+            # collect all data to numpy, then batch-convert
+            batch_size = len(feature_array)
+            emb_dim = self.ITEM_EMB_FEAT[k]
+            seq_len = len(feature_array[0])
 
-        # 合并特征
+            # pre-allocate tensor
+            batch_emb_data = np.zeros((batch_size, seq_len, emb_dim), dtype=np.float32)
+
+            for i, seq in enumerate(feature_array):
+                for j, item in enumerate(seq):
+                    if k in item:
+                        batch_emb_data[i, j] = item[k]
+
+            # batch-convert and transfer to GPU
+            tensor_feature = torch.from_numpy(batch_emb_data).to(self.dev)
+            item_feat_list.append(self.emb_transform[k](tensor_feature))
+
+        # merge features
         all_item_emb = torch.cat(item_feat_list, dim=2)
+        all_item_emb = torch.relu(self.itemdnn(all_item_emb))
         if include_user:
             all_user_emb = torch.cat(user_feat_list, dim=2)
+            all_user_emb = torch.relu(self.userdnn(all_user_emb))
             seqs_emb = all_item_emb + all_user_emb
         else:
             seqs_emb = all_item_emb
-            
         return seqs_emb
 
-    def forward(self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type,
-                seq_feature_tensors, pos_feature_tensors, neg_feature_tensors):
+    def log2feats(self, log_seqs, mask, seq_feature):
         """
-        训练时的前向传播
-        
+        Args:
+            log_seqs: 序列ID
+            mask: token类型掩码，1表示item token，2表示user token
+            seq_feature: 序列特征list，每个元素为当前时刻的特征字典
+
+        Returns:
+            seqs_emb: 序列的Embedding，形状为 [batch_size, maxlen, hidden_units]
+        """
+        batch_size = log_seqs.shape[0]
+        maxlen = log_seqs.shape[1]
+        seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
+        seqs *= self.item_emb.embedding_dim**0.5
+        poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
+        poss *= log_seqs != 0
+        seqs += self.pos_emb(poss)
+        seqs = self.emb_dropout(seqs)
+
+        maxlen = seqs.shape[1]
+        ones_matrix = torch.ones((maxlen, maxlen), dtype=torch.bool, device=self.dev)
+        attention_mask_tril = torch.tril(ones_matrix)
+        attention_mask_pad = (mask != 0).to(self.dev)
+        attention_mask = attention_mask_tril.unsqueeze(0) & attention_mask_pad.unsqueeze(1)
+
+        for i in range(len(self.attention_layers)):
+            if self.norm_first:
+                x = self.attention_layernorms[i](seqs)
+                mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask)
+                seqs = seqs + mha_outputs
+                seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
+            else:
+                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
+                seqs = self.attention_layernorms[i](seqs + mha_outputs)
+                seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
+
+        log_feats = self.last_layernorm(seqs)
+
+        return log_feats
+
+    def forward(
+        self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature
+    ):
+        """
+        训练时调用，计算正负样本的logits
+
         Args:
             user_item: 用户序列ID
             pos_seqs: 正样本序列ID
             neg_seqs: 负样本序列ID
-            mask: token类型掩码
-            next_mask: 下一个token类型掩码
-            next_action_type: 下一个token动作类型
-            seq_feature_tensors: 序列特征张量字典
-            pos_feature_tensors: 正样本特征张量字典
-            neg_feature_tensors: 负样本特征张量字典
-            
+            mask: token类型掩码，1表示item token，2表示user token
+            next_mask: 下一个token类型掩码，1表示item token，2表示user token
+            next_action_type: 下一个token动作类型，0表示曝光，1表示点击
+            seq_feature: 序列特征list，每个元素为当前时刻的特征字典
+            pos_feature: 正样本特征list，每个元素为当前时刻的特征字典
+            neg_feature: 负样本特征list，每个元素为当前时刻的特征字典
+
         Returns:
-            seq_embs: 序列嵌入
-            pos_embs: 正样本嵌入
-            neg_embs: 负样本嵌入
-            loss_mask: 损失掩码
+            seq_embs: 序列嵌入，形状为 [B, D]
+            pos_embs: 正样本嵌入，形状为 [B, D]
+            neg_embs: 负样本嵌入，形状为 [B, N, D]
+            loss_mask: 损失掩码，形状为 [B]
         """
-        # 处理序列特征
-        seq_embeddings = self.feat2emb(user_item, seq_feature_tensors, mask=mask, include_user=True)
-        
-        # 创建past_lengths张量（实际序列长度）
-        past_lengths = (mask != 0).sum(dim=1).long()
-        
-        # 创建past_payloads字典
-        past_payloads = {}
-        if 'timestamps' in seq_feature_tensors:
-            past_payloads['timestamps'] = seq_feature_tensors['timestamps']
-        if 'ratings' in seq_feature_tensors:
-            past_payloads['ratings'] = seq_feature_tensors['ratings']
-        
-        # 通过HSTU前向传播
-        seq_embs = self.hstu(
-            past_lengths=past_lengths,
-            past_ids=user_item,
-            past_embeddings=seq_embeddings,
-            past_payloads=past_payloads,
-        )
-        
-        # 处理正负样本
-        pos_embs = self.feat2emb(pos_seqs, pos_feature_tensors, include_user=False)
-        neg_embs = self.feat2emb(neg_seqs, neg_feature_tensors, include_user=False)
-        
-        # 创建损失掩码
+        log_feats = self.log2feats(user_item, mask, seq_feature)
         loss_mask = (next_mask == 1).to(self.dev)
+
+        pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
+        neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
+
+        # Get the last non-padded token for sequence embeddings
+        seq_lens = (user_item != 0).sum(dim=1) - 1  # Get last valid index
+        batch_size = user_item.size(0)
+        seq_embs = log_feats[torch.arange(batch_size), seq_lens]
         
+        # Get corresponding positive and negative embeddings
+        pos_embs = pos_embs[torch.arange(batch_size), seq_lens]
+        neg_embs = neg_embs[torch.arange(batch_size), seq_lens]
+
         return seq_embs, pos_embs, neg_embs, loss_mask
 
-    def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask, writer=None):
+    def predict(self, log_seqs, seq_feature, mask):
         """
-        计算InfoNCE损失函数
-        """
-        # 只保留有效位置
-        valid_indices = loss_mask.bool()
-        
-        # 提取有效嵌入
-        seq_embs_valid = seq_embs[valid_indices]
-        pos_embs_valid = pos_embs[valid_indices]
-        neg_embs_valid = neg_embs[valid_indices]
-        
-        # 归一化嵌入
-        seq_embs_valid = F.normalize(seq_embs_valid, p=2, dim=-1)
-        pos_embs_valid = F.normalize(pos_embs_valid, p=2, dim=-1)
-        neg_embs_valid = F.normalize(neg_embs_valid, p=2, dim=-1)
-        
-        # 计算正样本相似度
-        pos_sim = torch.sum(seq_embs_valid * pos_embs_valid, dim=-1)
-        
-        # 计算负样本相似度
-        neg_sim = torch.matmul(seq_embs_valid, neg_embs_valid.transpose(-1, -2))
-        
-        # 避免负样本中包含正样本
-        neg_sim = neg_sim - torch.eye(neg_sim.size(0), device=neg_sim.device) * 1e9
-        
-        # 拼接正负样本相似度
-        logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
-        
-        # 应用温度参数
-        logits = logits / self.temperature
-        
-        # 创建标签
-        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-        
-        # 计算交叉熵损失
-        loss = F.cross_entropy(logits, labels)
-        
-        # 记录到TensorBoard
-        if writer is not None:
-            writer.add_scalar("Model/nce_pos_logits", pos_sim.mean().item())
-            writer.add_scalar("Model/nce_neg_logits", neg_sim.mean().item())
-            writer.add_scalar("Model/temperature", self.temperature)
-        
-        return loss
-
-    def predict(self, log_seqs, seq_feature_tensors, mask):
-        """
-        计算用户序列表征
-        
+        计算用户序列的表征
         Args:
             log_seqs: 用户序列ID
-            seq_feature_tensors: 序列特征张量字典
-            mask: token类型掩码
-            
+            seq_feature: 序列特征list，每个元素为当前时刻的特征字典
+            mask: token类型掩码，1表示item token，2表示user token
         Returns:
-            final_feat: 用户序列表征（已归一化）
+            final_feat: 用户序列的表征，形状为 [batch_size, hidden_units]
         """
-        # 处理序列特征
-        seq_embeddings = self.feat2emb(log_seqs, seq_feature_tensors, mask=mask, include_user=True)
-        
-        # 创建past_lengths张量
-        past_lengths = (mask != 0).sum(dim=1).long()
-        
-        # 创建past_payloads字典
-        past_payloads = {}
-        if 'timestamps' in seq_feature_tensors:
-            past_payloads['timestamps'] = seq_feature_tensors['timestamps']
-        if 'ratings' in seq_feature_tensors:
-            past_payloads['ratings'] = seq_feature_tensors['ratings']
-        
-        # 通过HSTU前向传播
-        log_feats = self.hstu(
-            past_lengths=past_lengths,
-            past_ids=log_seqs,
-            past_embeddings=seq_embeddings,
-            past_payloads=past_payloads,
-        )
-        
-        # 获取最后一个token嵌入
+        log_feats = self.log2feats(log_seqs, mask, seq_feature)
+
         final_feat = log_feats[:, -1, :]
-        
-        # 归一化嵌入，与训练保持一致
-        final_feat = F.normalize(final_feat, p=2, dim=-1)
-        
+
+        # L2 normalization to maintain consistency with training
+        final_feat = final_feat / final_feat.norm(dim=-1, keepdim=True)
+
         return final_feat
+
+    def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask):
+        """
+        seq_embs: [B, D] sequence embeddings
+        pos_embs: [B, D] positive embeddings
+        neg_embs: [B, N, D] negative embeddings
+        loss_mask: [B] mask to filter valid samples
+        """
+        hidden_size = neg_embs.size(-1)
+
+        # L2 normalization
+        seq_embs = seq_embs / seq_embs.norm(dim=-1, keepdim=True)
+        pos_embs = pos_embs / pos_embs.norm(dim=-1, keepdim=True)
+        neg_embs = neg_embs / neg_embs.norm(dim=-1, keepdim=True)
+
+        # Positive logits (cosine similarity)
+        pos_logits = F.cosine_similarity(seq_embs, pos_embs, dim=-1).unsqueeze(-1)
+
+        if self.writer is not None:
+            self.writer.add_scalar("Model/nce_pos_logits", pos_logits.mean().item())
+
+        # Negative logits: reshape negatives [B, N, D] -> [B, N*D]
+        neg_embedding_all = neg_embs.reshape(-1, hidden_size)  # [B*N, D]
+        neg_logits = torch.matmul(seq_embs, neg_embedding_all.transpose(0, 1))  # [B, B*N]
+
+        if self.writer is not None:
+            self.writer.add_scalar("Model/nce_neg_logits", neg_logits.mean().item())
+
+        # Concatenate positive and negative logits
+        logits = torch.cat([pos_logits, neg_logits], dim=-1)  # [B, 1+N*B]
+
+        # Apply mask and temperature scaling
+        logits = logits[loss_mask.bool()] / self.temp
+
+        # Labels: 0 means the positive sample is always at index 0
+        labels = torch.zeros(logits.size(0), device=logits.device, dtype=torch.long)
+
+        # Cross-entropy loss
+        loss = F.cross_entropy(logits, labels)
+
+        return loss
 
     def save_item_emb(self, item_ids, retrieval_ids, feat_dict, save_path, batch_size=1024):
         """
-        生成候选库物品嵌入，用于检索
-        
+        生成候选库item embedding，用于检索
+
         Args:
-            item_ids: 候选物品ID（re-id形式）
-            retrieval_ids: 候选物品ID（检索ID，从0开始编号）
-            feat_dict: 训练集所有物品特征字典
+            item_ids: 候选item ID（re-id形式）
+            retrieval_ids: 候选item ID（检索ID，从0开始编号，检索脚本使用）
+            feat_dict: 训练集所有item特征字典，key为特征ID，value为特征值
             save_path: 保存路径
             batch_size: 批次大小
         """
@@ -369,48 +473,14 @@ class HSTUModel(torch.nn.Module):
 
             batch_feat = np.array(batch_feat, dtype=object)
 
-            # 转换特征为张量
-            feature_tensors = {}
-            for feat_type, feat_dict_type in [
-                ('item_sparse', self.ITEM_SPARSE_FEAT),
-                ('item_array', self.ITEM_ARRAY_FEAT),
-            ]:
-                for feat_id in feat_dict_type:
-                    from dataset import MyDataset
-                    dummy_dataset = MyDataset.__new__(MyDataset)
-                    dummy_dataset.ITEM_SPARSE_FEAT = self.ITEM_SPARSE_FEAT
-                    dummy_dataset.ITEM_ARRAY_FEAT = self.ITEM_ARRAY_FEAT
-                    dummy_dataset.ITEM_CONTINUAL_FEAT = self.ITEM_CONTINUAL_FEAT
-                    dummy_dataset.ITEM_EMB_FEAT = self.ITEM_EMB_FEAT
-                    dummy_dataset.feature_types = {
-                        'item_sparse': list(self.ITEM_SPARSE_FEAT.keys()),
-                        'item_array': list(self.ITEM_ARRAY_FEAT.keys()),
-                        'item_emb': list(self.ITEM_EMB_FEAT.keys()),
-                        'item_continual': []
-                    }
-                    feature_tensors[feat_id] = dummy_dataset.feat2tensor([batch_feat], feat_id, self.dev)
+            batch_emb = self.feat2emb(item_seq, [batch_feat], include_user=False).squeeze(0)
 
-            # 处理嵌入特征
-            for k in self.ITEM_EMB_FEAT:
-                batch_size_feat = len(batch_feat)
-                seq_len = 1
-                emb_dim = self.ITEM_EMB_FEAT[k]
-                
-                batch_emb_data = np.zeros((batch_size_feat, seq_len, emb_dim), dtype=np.float32)
-                for i, item in enumerate(batch_feat):
-                    if k in item:
-                        batch_emb_data[i, 0] = item[k]
-                
-                feature_tensors[k] = torch.from_numpy(batch_emb_data).to(self.dev)
-
-            batch_emb = self.feat2emb(item_seq, feature_tensors, include_user=False).squeeze(0)
-            
-            # 归一化嵌入，与训练保持一致
-            batch_emb = F.normalize(batch_emb, p=2, dim=-1)
+            # L2 normalization to maintain consistency with training
+            batch_emb = batch_emb / batch_emb.norm(dim=-1, keepdim=True)
 
             all_embs.append(batch_emb.detach().cpu().numpy().astype(np.float32))
 
-        # 合并所有批次结果并保存
+        # 合并所有批次的结果并保存
         final_ids = np.array(retrieval_ids, dtype=np.uint64).reshape(-1, 1)
         final_embs = np.concatenate(all_embs, axis=0)
         save_emb(final_embs, Path(save_path, 'embedding.fbin'))

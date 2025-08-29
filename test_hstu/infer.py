@@ -31,12 +31,15 @@ def get_args():
     parser.add_argument('--maxlen', default=101, type=int)
 
     # Baseline Model construction
-    parser.add_argument('--hidden_units', default=128, type=int)
-    parser.add_argument('--num_blocks', default=8, type=int)
+    parser.add_argument('--hidden_units', default=32, type=int)
+    parser.add_argument('--num_blocks', default=1, type=int)
     parser.add_argument('--num_epochs', default=3, type=int)
-    parser.add_argument('--num_heads', default=8, type=int)
+    parser.add_argument('--num_heads', default=1, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--l2_emb', default=0.0, type=float)
+    parser.add_argument('--weight_decay', default=0.01, type=float)
+    parser.add_argument('--T_max', default=100, type=int)
+    parser.add_argument('--infonce_temp', default=0.1, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)

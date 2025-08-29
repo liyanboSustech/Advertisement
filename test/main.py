@@ -4,66 +4,14 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dataset import MyDataset
-from model import HSTUModel
-import torch.nn.functional as F
-
-def compute_infonce_loss(seq_embs, pos_embs, neg_embs, loss_mask, writer):
-    """
-    计算InfoNCE损失函数x
-
-    Args:
-        seq_embs: 序列embeddings [batch_size, hidden_size]
-        pos_embs: 正样本embeddings [batch_size, hidden_size]
-        neg_embs: 负样本embeddings [batch_size, num_negatives, hidden_size]
-        loss_mask: 损失掩码 [batch_size]
-
-    Returns:
-        loss: InfoNCE损失值
-   
-        计算InfoNCE损失函数
-        
-        Args:
-            seq_embs: 序列embeddings [batch_size, hidden_size]
-            pos_embs: 正样本embeddings [batch_size, hidden_size] 
-            neg_embs: 负样本embeddings [batch_size, num_negatives, hidden_size]
-            loss_mask: 损失掩码 [batch_size]
-        
-        Returns:
-            loss: InfoNCE损失值
-    """
-    hidden_size = neg_embs.size(-1)
-    # 归一化序列embeddings
-    seq_embs = seq_embs / seq_embs.norm(dim=-1, keepdim=True)
-    # 归一化正样本embeddings
-    pos_embs = pos_embs / pos_embs.norm(dim=-1, keepdim=True)
-    # 计算正样本logits (余弦相似度)
-    pos_logits = F.cosine_similarity(seq_embs, pos_embs, dim=-1).unsqueeze(-1)
-    # 记录正样本logits到tensorboard
-    writer.add_scalar("Model/nce_pos_logits", pos_logits.mean().item())
-    # 归一化负样本embeddings
-    neg_embs = neg_embs / neg_embs.norm(dim=-1, keepdim=True)
-    # 将负样本reshape为矩阵乘法格式
-    neg_embedding_all = neg_embs.reshape(-1, hidden_size)
-    # 计算负样本logits (批量矩阵乘法)
-    neg_logits = torch.matmul(seq_embs, neg_embedding_all.transpose(-1, -2))
-    # 记录负样本logits到tensorboard
-    writer.add_scalar("Model/nce_neg_logits", neg_logits.mean().item())
-    # 拼接正负样本logits
-    logits = torch.cat([pos_logits, neg_logits], dim=-1)
-    # 应用温度参数和损失掩码
-    logits = logits[loss_mask.bool()] / args.temperature
-    # 创建标签 (正样本的索引总是0)
-    labels = torch.zeros(logits.size(0), device=logits.device, dtype=torch.long)
-    # 计算交叉熵损失
-    loss = F.cross_entropy(logits, labels)
-    
-    return loss
+from model import BaselineModel
 
 
 def get_args():
@@ -76,20 +24,21 @@ def get_args():
 
     # Baseline Model construction
     parser.add_argument('--hidden_units', default=128, type=int)
-    parser.add_argument('--num_blocks', default=4, type=int)
+    parser.add_argument('--num_blocks', default=8, type=int)
     parser.add_argument('--num_epochs', default=3, type=int)
-    parser.add_argument('--num_heads', default=4, type=int)
+    parser.add_argument('--num_heads', default=8, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--l2_emb', default=0.0, type=float)
-    parser.add_argument('--weight_decay', default=0.01, type=float)
-    parser.add_argument('--T_max', default=100, type=int)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
     parser.add_argument('--norm_first', action='store_true')
-    parser.add_argument('--temperature', default=0.07, type=float)
+
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
+    
+    # InfoNCE loss parameters
+    parser.add_argument('--temp', default=0.1, type=float, help='Temperature parameter for InfoNCE loss')
 
     args = parser.parse_args()
 
@@ -108,15 +57,15 @@ if __name__ == '__main__':
     dataset = MyDataset(data_path, args)
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=6, collate_fn=dataset.collate_fn
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=dataset.collate_fn
     )
     valid_loader = DataLoader(
-        valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=6, collate_fn=dataset.collate_fn
+        valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn
     )
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
 
-    model = HSTUModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
 
     for name, param in model.named_parameters():
         try:
@@ -143,8 +92,9 @@ if __name__ == '__main__':
             print(args.state_dict_path)
             raise RuntimeError('failed loading state_dicts, pls check file path!')
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.T_max)
+    # Set TensorBoard writer for model
+    model.writer = writer
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
 
     best_val_ndcg, best_val_hr = 0.0, 0.0
     best_test_ndcg, best_test_hr = 0.0, 0.0
@@ -152,13 +102,10 @@ if __name__ == '__main__':
     t0 = time.time()
     global_step = 0
     print("Start training")
-    print(f"Cosine annealing: T_max={args.T_max}, initial_lr={args.lr}")
     for epoch in range(epoch_start_idx, args.num_epochs + 1):
         model.train()
         if args.inference_only:
             break
-        
-        print(f"Epoch {epoch}: Starting training")
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
             seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
             seq = seq.to(args.device)
@@ -168,23 +115,23 @@ if __name__ == '__main__':
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
             )
             optimizer.zero_grad()
-            loss = model.compute_infonce_loss(seq_embs, pos_embs, neg_embs, loss_mask, args.infonce_temp, writer)
+            loss = model.compute_infonce_loss(seq_embs, pos_embs, neg_embs, loss_mask)
 
             log_json = json.dumps(
-                {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'lr': optimizer.param_groups[0]['lr'], 'time': time.time()}
+                {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': time.time()}
             )
             log_file.write(log_json + '\n')
             log_file.flush()
             print(log_json)
 
             writer.add_scalar('Loss/train', loss.item(), global_step)
-            writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], global_step)
 
             global_step += 1
 
+            for param in model.item_emb.parameters():
+                loss += args.l2_emb * torch.norm(param)
             loss.backward()
             optimizer.step()
-            scheduler.step()
 
         model.eval()
         valid_loss_sum = 0
@@ -196,7 +143,7 @@ if __name__ == '__main__':
             seq_embs, pos_embs, neg_embs, loss_mask = model(
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
             )
-            loss = model.compute_infonce_loss(seq_embs, pos_embs, neg_embs, loss_mask, args.infonce_temp, writer)
+            loss = model.compute_infonce_loss(seq_embs, pos_embs, neg_embs, loss_mask)
             valid_loss_sum += loss.item()
         valid_loss_sum /= len(valid_loader)
         writer.add_scalar('Loss/valid', valid_loss_sum, global_step)
