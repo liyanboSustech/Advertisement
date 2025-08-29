@@ -1,8 +1,5 @@
-"""
-HSTU模型实现
-基于Meta的生成式推荐系统中的HSTU架构
-适配现有代码框架和特征处理
-"""
+import math
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -11,31 +8,28 @@ from tqdm import tqdm
 from pathlib import Path
 
 from dataset import save_emb
+from dot_product_similarity import DotProductSimilarity
 from hstu_components import (
     LocalEmbeddingModule,
     LearnablePositionalEmbeddingInputFeaturesPreprocessor,
     L2NormEmbeddingPostprocessor,
 )
 from simplified_hstu import HSTU
-from dot_product_similarity import DotProductSimilarity
 
 
 class HSTUModel(torch.nn.Module):
     """
-    HSTU (Hierarchical Sequential Transduction Unit) 模型
+    HSTU (Hierarchical Sequential Transduction Unit) model adapted for the existing codebase.
     
-    适配现有代码架构的HSTU实现，支持：
-    - 多种特征类型处理（稀疏、数组、连续、嵌入特征）
-    - InfoNCE损失函数
-    - 序列编码和预测
-    - 候选库嵌入生成
+    This model replaces the BaselineModel with the HSTU architecture from the generative-recommenders repository.
+    It maintains compatibility with the existing dataset and training pipeline.
     
     Args:
         user_num: 用户数量
         item_num: 物品数量
-        feat_statistics: 特征统计信息
-        feat_types: 特征类型分类
-        args: 训练参数
+        feat_statistics: 特征统计信息，key为特征ID，value为特征数量
+        feat_types: 各个特征的特征类型，key为特征类型名称，value为包含的特征ID列表
+        args: 全局参数
     """
 
     def __init__(self, user_num, item_num, feat_statistics, feat_types, args):
@@ -47,41 +41,41 @@ class HSTUModel(torch.nn.Module):
         self.maxlen = args.maxlen
         self.temperature = getattr(args, 'infonce_temp', 0.1)
         
-        # HSTU特定参数
+        # HSTU specific parameters
         self.num_blocks = getattr(args, 'num_blocks', 2)
         self.num_heads = getattr(args, 'num_heads', 1)
         self.attention_dim = getattr(args, 'attention_dim', 64)
         self.linear_dim = getattr(args, 'linear_dim', 64)
         self.dropout_rate = getattr(args, 'dropout_rate', 0.2)
         
-        # 初始化特征信息
+        # Initialize feature information
         self._init_feat_info(feat_statistics, feat_types)
         
-        # 创建HSTU嵌入模块
+        # Create embedding module for HSTU
         self.embedding_module = LocalEmbeddingModule(
             num_items=item_num,
             item_embedding_dim=args.hidden_units,
         )
         
-        # 创建输入特征预处理器
+        # Create input features preprocessor
         self.input_preprocessor = LearnablePositionalEmbeddingInputFeaturesPreprocessor(
             max_sequence_len=args.maxlen,
             embedding_dim=args.hidden_units,
             dropout_rate=self.dropout_rate,
         )
         
-        # 创建输出后处理器
+        # Create output postprocessor
         self.output_postprocessor = L2NormEmbeddingPostprocessor(
             embedding_dim=args.hidden_units,
         )
         
-        # 创建相似度模块
+        # Create similarity module
         self.similarity_module = DotProductSimilarity()
         
-        # 创建HSTU模型
+        # Create HSTU model
         self.hstu = HSTU(
             max_sequence_len=args.maxlen,
-            max_output_len=1,
+            max_output_len=1,  # For next item prediction
             embedding_dim=args.hidden_units,
             num_blocks=self.num_blocks,
             num_heads=self.num_heads,
@@ -97,11 +91,11 @@ class HSTUModel(torch.nn.Module):
             verbose=False,
         )
         
-        # 特征处理模块（处理额外特征）
+        # Feature processing modules (to handle additional features)
         self.sparse_emb = torch.nn.ModuleDict()
         self.emb_transform = torch.nn.ModuleDict()
         
-        # 初始化特征嵌入
+        # Initialize feature embeddings
         for k in self.USER_SPARSE_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(
                 self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0
@@ -124,7 +118,9 @@ class HSTUModel(torch.nn.Module):
             )
 
     def _init_feat_info(self, feat_statistics, feat_types):
-        """初始化特征信息"""
+        """
+        将特征统计信息按特征类型分组产生不同的字典
+        """
         self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['user_sparse']}
         self.USER_CONTINUAL_FEAT = feat_types['user_continual']
         self.ITEM_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['item_sparse']}
@@ -136,23 +132,23 @@ class HSTUModel(torch.nn.Module):
 
     def feat2emb(self, seq, feature_tensors, mask=None, include_user=False):
         """
-        将特征转换为嵌入向量
+        Convert features to embeddings, compatible with existing dataset format
         
         Args:
             seq: 序列ID
-            feature_tensors: 预处理的特征张量字典
-            mask: 掩码（1=item, 2=user）
-            include_user: 是否包含用户特征
-            
+            feature_tensors: 预处理好的特征tensor字典
+            mask: 掩码，1表示item，2表示user
+            include_user: 是否处理用户特征
+
         Returns:
-            seqs_emb: 序列特征嵌入
+            seqs_emb: 序列特征的Embedding
         """
         seq = seq.to(self.dev)
         
-        # 获取基础物品嵌入
+        # Get base item embeddings
         item_embeddings = self.embedding_module.get_item_embeddings(seq)
         
-        # 处理额外特征
+        # Process additional features
         item_feat_list = [item_embeddings]
         user_feat_list = []
         
@@ -161,7 +157,7 @@ class HSTUModel(torch.nn.Module):
             user_embedding = self.embedding_module.get_item_embeddings(user_mask * seq)
             user_feat_list = [user_embedding]
         
-        # 批量处理所有特征类型
+        # Batch-process all feature types
         all_feat_types = [
             (self.ITEM_SPARSE_FEAT, 'item_sparse', item_feat_list),
             (self.ITEM_ARRAY_FEAT, 'item_array', item_feat_list),
@@ -175,7 +171,7 @@ class HSTUModel(torch.nn.Module):
                 (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list),
             ])
 
-        # 处理每种特征类型
+        # Process each feature type
         for feat_dict, feat_type, feat_list in all_feat_types:
             if not feat_dict:
                 continue
@@ -191,13 +187,13 @@ class HSTUModel(torch.nn.Module):
                     elif feat_type.endswith('continual'):
                         feat_list.append(tensor_feature.unsqueeze(2))
 
-        # 处理嵌入特征
+        # Process embedding features
         for k in self.ITEM_EMB_FEAT:
             if k in feature_tensors:
                 tensor_feature = feature_tensors[k].to(self.dev)
                 item_feat_list.append(self.emb_transform[k](tensor_feature))
 
-        # 合并特征
+        # Combine features
         all_item_emb = torch.cat(item_feat_list, dim=2)
         if include_user:
             all_user_emb = torch.cat(user_feat_list, dim=2)
@@ -207,10 +203,10 @@ class HSTUModel(torch.nn.Module):
             
         return seqs_emb
 
-    def forward(self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type,
+    def forward(self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, 
                 seq_feature_tensors, pos_feature_tensors, neg_feature_tensors):
         """
-        训练时的前向传播
+        训练时调用，计算序列和正负样本的embeddings
         
         Args:
             user_item: 用户序列ID
@@ -219,30 +215,33 @@ class HSTUModel(torch.nn.Module):
             mask: token类型掩码
             next_mask: 下一个token类型掩码
             next_action_type: 下一个token动作类型
-            seq_feature_tensors: 序列特征张量字典
-            pos_feature_tensors: 正样本特征张量字典
-            neg_feature_tensors: 负样本特征张量字典
-            
+            seq_feature_tensors: 序列特征tensor字典
+            pos_feature_tensors: 正样本特征tensor字典
+            neg_feature_tensors: 负样本特征tensor字典
+
         Returns:
-            seq_embs: 序列嵌入
-            pos_embs: 正样本嵌入
-            neg_embs: 负样本嵌入
+            seq_embs: 序列embeddings
+            pos_embs: 正样本embeddings
+            neg_embs: 负样本embeddings
             loss_mask: 损失掩码
         """
-        # 处理序列特征
+        batch_size = user_item.shape[0]
+        seq_len = user_item.shape[1]
+        
+        # Process sequence features
         seq_embeddings = self.feat2emb(user_item, seq_feature_tensors, mask=mask, include_user=True)
         
-        # 创建past_lengths张量（实际序列长度）
+        # Create past_lengths tensor (actual sequence lengths)
         past_lengths = (mask != 0).sum(dim=1).long()
         
-        # 创建past_payloads字典
+        # Create past_payloads dictionary
         past_payloads = {}
         if 'timestamps' in seq_feature_tensors:
             past_payloads['timestamps'] = seq_feature_tensors['timestamps']
         if 'ratings' in seq_feature_tensors:
             past_payloads['ratings'] = seq_feature_tensors['ratings']
         
-        # 通过HSTU前向传播
+        # Forward through HSTU
         seq_embs = self.hstu(
             past_lengths=past_lengths,
             past_ids=user_item,
@@ -250,11 +249,11 @@ class HSTUModel(torch.nn.Module):
             past_payloads=past_payloads,
         )
         
-        # 处理正负样本
+        # Process positive and negative samples
         pos_embs = self.feat2emb(pos_seqs, pos_feature_tensors, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature_tensors, include_user=False)
         
-        # 创建损失掩码
+        # Create loss mask
         loss_mask = (next_mask == 1).to(self.dev)
         
         return seq_embs, pos_embs, neg_embs, loss_mask
@@ -263,35 +262,35 @@ class HSTUModel(torch.nn.Module):
         """
         计算InfoNCE损失函数
         """
-        # 只保留有效位置
+        # 只保留有效的位置（根据loss_mask）
         valid_indices = loss_mask.bool()
         
-        # 提取有效嵌入
+        # 提取有效的embeddings
         seq_embs_valid = seq_embs[valid_indices]
         pos_embs_valid = pos_embs[valid_indices]
         neg_embs_valid = neg_embs[valid_indices]
         
-        # 归一化嵌入
+        # 归一化embeddings
         seq_embs_valid = F.normalize(seq_embs_valid, p=2, dim=-1)
         pos_embs_valid = F.normalize(pos_embs_valid, p=2, dim=-1)
         neg_embs_valid = F.normalize(neg_embs_valid, p=2, dim=-1)
         
-        # 计算正样本相似度
+        # 计算正样本的相似度
         pos_sim = torch.sum(seq_embs_valid * pos_embs_valid, dim=-1)
         
-        # 计算负样本相似度
+        # 计算负样本的相似度
         neg_sim = torch.matmul(seq_embs_valid, neg_embs_valid.transpose(-1, -2))
         
-        # 避免负样本中包含正样本
+        # 为了避免负样本中包含正样本，将对角线设为很小的值
         neg_sim = neg_sim - torch.eye(neg_sim.size(0), device=neg_sim.device) * 1e9
         
-        # 拼接正负样本相似度
+        # 拼接正负样本的相似度
         logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
         
         # 应用温度参数
         logits = logits / self.temperature
         
-        # 创建标签
+        # 创建标签（正样本的索引是0）
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
         
         # 计算交叉熵损失
@@ -307,30 +306,24 @@ class HSTUModel(torch.nn.Module):
 
     def predict(self, log_seqs, seq_feature_tensors, mask):
         """
-        计算用户序列表征
-        
-        Args:
-            log_seqs: 用户序列ID
-            seq_feature_tensors: 序列特征张量字典
-            mask: token类型掩码
-            
-        Returns:
-            final_feat: 用户序列表征（已归一化）
+        计算用户序列的表征
         """
-        # 处理序列特征
+        batch_size = log_seqs.shape[0]
+        
+        # Process sequence features
         seq_embeddings = self.feat2emb(log_seqs, seq_feature_tensors, mask=mask, include_user=True)
         
-        # 创建past_lengths张量
+        # Create past_lengths tensor
         past_lengths = (mask != 0).sum(dim=1).long()
         
-        # 创建past_payloads字典
+        # Create past_payloads dictionary
         past_payloads = {}
         if 'timestamps' in seq_feature_tensors:
             past_payloads['timestamps'] = seq_feature_tensors['timestamps']
         if 'ratings' in seq_feature_tensors:
             past_payloads['ratings'] = seq_feature_tensors['ratings']
         
-        # 通过HSTU前向传播
+        # Forward through HSTU
         log_feats = self.hstu(
             past_lengths=past_lengths,
             past_ids=log_seqs,
@@ -338,24 +331,17 @@ class HSTUModel(torch.nn.Module):
             past_payloads=past_payloads,
         )
         
-        # 获取最后一个token嵌入
+        # Get the last token embedding
         final_feat = log_feats[:, -1, :]
         
-        # 归一化嵌入，与训练保持一致
+        # 归一化embeddings，与训练时保持一致
         final_feat = F.normalize(final_feat, p=2, dim=-1)
         
         return final_feat
 
     def save_item_emb(self, item_ids, retrieval_ids, feat_dict, save_path, batch_size=1024):
         """
-        生成候选库物品嵌入，用于检索
-        
-        Args:
-            item_ids: 候选物品ID（re-id形式）
-            retrieval_ids: 候选物品ID（检索ID，从0开始编号）
-            feat_dict: 训练集所有物品特征字典
-            save_path: 保存路径
-            batch_size: 批次大小
+        生成候选库item embedding，用于检索
         """
         all_embs = []
 
@@ -369,7 +355,7 @@ class HSTUModel(torch.nn.Module):
 
             batch_feat = np.array(batch_feat, dtype=object)
 
-            # 转换特征为张量
+            # Convert features to tensors
             feature_tensors = {}
             for feat_type, feat_dict_type in [
                 ('item_sparse', self.ITEM_SPARSE_FEAT),
@@ -390,7 +376,7 @@ class HSTUModel(torch.nn.Module):
                     }
                     feature_tensors[feat_id] = dummy_dataset.feat2tensor([batch_feat], feat_id, self.dev)
 
-            # 处理嵌入特征
+            # Handle embedding features
             for k in self.ITEM_EMB_FEAT:
                 batch_size_feat = len(batch_feat)
                 seq_len = 1
@@ -405,12 +391,12 @@ class HSTUModel(torch.nn.Module):
 
             batch_emb = self.feat2emb(item_seq, feature_tensors, include_user=False).squeeze(0)
             
-            # 归一化嵌入，与训练保持一致
+            # 归一化embeddings，与训练时保持一致
             batch_emb = F.normalize(batch_emb, p=2, dim=-1)
 
             all_embs.append(batch_emb.detach().cpu().numpy().astype(np.float32))
 
-        # 合并所有批次结果并保存
+        # 合并所有批次的结果并保存
         final_ids = np.array(retrieval_ids, dtype=np.uint64).reshape(-1, 1)
         final_embs = np.concatenate(all_embs, axis=0)
         save_emb(final_embs, Path(save_path, 'embedding.fbin'))

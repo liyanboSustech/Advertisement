@@ -246,13 +246,18 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             filled_feat: 填充后的特征字典
         """
+        # 解释每一行代码
+        #   如果特征字典为空，则初始化为空字典
         if feat == None:
             feat = {}
+            # 如果特征字典为空，则初始化为空字典
         filled_feat = {}
+        # 遍历原始特征字典，将特征值填充到新字典中
         for k in feat.keys():
             filled_feat[k] = feat[k]
-
+        # 收集所有特征ID
         all_feat_ids = []
+        
         for feat_type in self.feature_types.values():
             all_feat_ids.extend(feat_type)
         missing_fields = set(all_feat_ids) - set(feat.keys())

@@ -10,7 +10,60 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dataset import MyDataset
-from model import BaselineModel
+from model import HSTUModel
+import torch.nn.functional as F
+
+def compute_infonce_loss(seq_embs, pos_embs, neg_embs, loss_mask, writer):
+    """
+    计算InfoNCE损失函数x
+
+    Args:
+        seq_embs: 序列embeddings [batch_size, hidden_size]
+        pos_embs: 正样本embeddings [batch_size, hidden_size]
+        neg_embs: 负样本embeddings [batch_size, num_negatives, hidden_size]
+        loss_mask: 损失掩码 [batch_size]
+
+    Returns:
+        loss: InfoNCE损失值
+   
+        计算InfoNCE损失函数
+        
+        Args:
+            seq_embs: 序列embeddings [batch_size, hidden_size]
+            pos_embs: 正样本embeddings [batch_size, hidden_size] 
+            neg_embs: 负样本embeddings [batch_size, num_negatives, hidden_size]
+            loss_mask: 损失掩码 [batch_size]
+        
+        Returns:
+            loss: InfoNCE损失值
+    """
+    hidden_size = neg_embs.size(-1)
+    # 归一化序列embeddings
+    seq_embs = seq_embs / seq_embs.norm(dim=-1, keepdim=True)
+    # 归一化正样本embeddings
+    pos_embs = pos_embs / pos_embs.norm(dim=-1, keepdim=True)
+    # 计算正样本logits (余弦相似度)
+    pos_logits = F.cosine_similarity(seq_embs, pos_embs, dim=-1).unsqueeze(-1)
+    # 记录正样本logits到tensorboard
+    writer.add_scalar("Model/nce_pos_logits", pos_logits.mean().item())
+    # 归一化负样本embeddings
+    neg_embs = neg_embs / neg_embs.norm(dim=-1, keepdim=True)
+    # 将负样本reshape为矩阵乘法格式
+    neg_embedding_all = neg_embs.reshape(-1, hidden_size)
+    # 计算负样本logits (批量矩阵乘法)
+    neg_logits = torch.matmul(seq_embs, neg_embedding_all.transpose(-1, -2))
+    # 记录负样本logits到tensorboard
+    writer.add_scalar("Model/nce_neg_logits", neg_logits.mean().item())
+    # 拼接正负样本logits
+    logits = torch.cat([pos_logits, neg_logits], dim=-1)
+    # 应用温度参数和损失掩码
+    logits = logits[loss_mask.bool()] / args.temperature
+    # 创建标签 (正样本的索引总是0)
+    labels = torch.zeros(logits.size(0), device=logits.device, dtype=torch.long)
+    # 计算交叉熵损失
+    loss = F.cross_entropy(logits, labels)
+    
+    return loss
 
 
 def get_args():
@@ -22,10 +75,10 @@ def get_args():
     parser.add_argument('--maxlen', default=101, type=int)
 
     # Baseline Model construction
-    parser.add_argument('--hidden_units', default=32, type=int)
-    parser.add_argument('--num_blocks', default=1, type=int)
+    parser.add_argument('--hidden_units', default=128, type=int)
+    parser.add_argument('--num_blocks', default=4, type=int)
     parser.add_argument('--num_epochs', default=3, type=int)
-    parser.add_argument('--num_heads', default=1, type=int)
+    parser.add_argument('--num_heads', default=4, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--l2_emb', default=0.0, type=float)
     parser.add_argument('--weight_decay', default=0.01, type=float)
@@ -34,7 +87,7 @@ def get_args():
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
     parser.add_argument('--norm_first', action='store_true')
-
+    parser.add_argument('--temperature', default=0.07, type=float)
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
 
@@ -63,7 +116,7 @@ if __name__ == '__main__':
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
 
-    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    model = HSTUModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
 
     for name, param in model.named_parameters():
         try:
