@@ -65,7 +65,7 @@ if __name__ == '__main__':
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
 
-    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types)
 
     for name, param in model.named_parameters():
         try:
@@ -93,7 +93,7 @@ if __name__ == '__main__':
             raise RuntimeError('failed loading state_dicts, pls check file path!')
 
     # Set TensorBoard writer for model
-    model.writer = writer
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
 
     best_val_ndcg, best_val_hr = 0.0, 0.0
@@ -115,7 +115,7 @@ if __name__ == '__main__':
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
             )
             optimizer.zero_grad()
-            loss = model.compute_infonce_loss(seq_embs, pos_embs, neg_embs, loss_mask)
+            loss = model.compute_infonce_loss(seq_embs, pos_embs, neg_embs, loss_mask,  writer= writer)
 
             log_json = json.dumps(
                 {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': time.time()}
@@ -143,7 +143,7 @@ if __name__ == '__main__':
             seq_embs, pos_embs, neg_embs, loss_mask = model(
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
             )
-            loss = model.compute_infonce_loss(seq_embs, pos_embs, neg_embs, loss_mask)
+            loss = model.compute_infonce_loss(seq_embs, pos_embs, neg_embs, loss_mask,  writer= writer)
             valid_loss_sum += loss.item()
         valid_loss_sum /= len(valid_loader)
         writer.add_scalar('Loss/valid', valid_loss_sum, global_step)

@@ -110,8 +110,7 @@ class BaselineModel(torch.nn.Module):
         self.dev = args.device
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
-        self.temp = getattr(args, 'temp', 0.1)  # InfoNCE temperature parameter
-        self.writer = None  # TensorBoard writer, will be set during training
+        self.temp = args.temp  # InfoNCE temperature parameter
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
         # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
 
@@ -409,7 +408,7 @@ class BaselineModel(torch.nn.Module):
 
         return final_feat
 
-    def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask):
+    def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask, writer=None):
         """
         seq_embs: [B, D] sequence embeddings
         pos_embs: [B, D] positive embeddings
@@ -426,15 +425,14 @@ class BaselineModel(torch.nn.Module):
         # Positive logits (cosine similarity)
         pos_logits = F.cosine_similarity(seq_embs, pos_embs, dim=-1).unsqueeze(-1)
 
-        if self.writer is not None:
-            self.writer.add_scalar("Model/nce_pos_logits", pos_logits.mean().item())
+        
+        writer.add_scalar("Model/nce_pos_logits", pos_logits.mean().item())
 
         # Negative logits: reshape negatives [B, N, D] -> [B, N*D]
         neg_embedding_all = neg_embs.reshape(-1, hidden_size)  # [B*N, D]
         neg_logits = torch.matmul(seq_embs, neg_embedding_all.transpose(0, 1))  # [B, B*N]
 
-        if self.writer is not None:
-            self.writer.add_scalar("Model/nce_neg_logits", neg_logits.mean().item())
+        self.writer.add_scalar("Model/nce_neg_logits", neg_logits.mean().item())
 
         # Concatenate positive and negative logits
         logits = torch.cat([pos_logits, neg_logits], dim=-1)  # [B, 1+N*B]
