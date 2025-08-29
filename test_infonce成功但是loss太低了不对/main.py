@@ -19,14 +19,14 @@ def get_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser()
     # 训练参数
-    parser.add_argument('--batch_size', default=128, type=int)
+    parser.add_argument('--batch_size', default=256, type=int)
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
     # 模型参数
-    parser.add_argument('--hidden_units', default=64, type=int)
-    parser.add_argument('--num_blocks', default=4, type=int)
+    parser.add_argument('--hidden_units', default=128, type=int)
+    parser.add_argument('--num_blocks', default=8, type=int)
     parser.add_argument('--num_epochs', default=3, type=int)
-    parser.add_argument('--num_heads', default=4, type=int)
+    parser.add_argument('--num_heads', default=8, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--l2_emb', default=0.0, type=float)
     parser.add_argument('--weight_decay', default=0.01, type=float)  # 新增 weight decay
@@ -40,7 +40,6 @@ def get_args():
                        choices=[str(s) for s in range(81, 87)])
     return parser.parse_args()
 
-# 
 
 def compute_infonce_loss(seq_embs, pos_embs, neg_embs, temperature, writer=None):
     """
@@ -228,7 +227,6 @@ if __name__ == '__main__':
         # 验证
         model.eval()
         valid_loss_sum = 0.0
-        valid_batches = 0
 
         with torch.no_grad():
             for batch in tqdm(valid_loader, total=len(valid_loader)):
@@ -259,23 +257,17 @@ if __name__ == '__main__':
                         valid_seq_embs, valid_pos_embs, valid_neg_embs,
                         args.temperature, writer=None
                     )
-                    
                     valid_loss_sum += loss.item()
-                    valid_batches += 1
                 else:
                     print(f"Warning: No valid positions in validation batch, skipping...")
+  
+                valid_loss_sum /= len(valid_loader)
+                writer.add_scalar('Loss/valid', valid_loss_sum, global_step)
+                print(f"Epoch {epoch} valid loss: {valid_loss_sum:.4f}")
 
-        # 计算平均验证损失
-        if valid_batches > 0:
-            valid_loss = valid_loss_sum / valid_batches
-            writer.add_scalar('Loss/valid', valid_loss, global_step)
-            print(f"Epoch {epoch} valid loss: {valid_loss:.4f}")
-
-            save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"epoch_{epoch}.valid_loss_{valid_loss:.4f}")
-            save_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(model.state_dict(), save_dir / "model.pt")
-        else:
-            print(f"Epoch {epoch}: No valid batches processed")
+        save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"global_step{global_step}.valid_loss={valid_loss_sum:.4f}")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), save_dir / "model.pt")
 
     print("Training done")
     writer.close()

@@ -58,11 +58,9 @@ class MyDataset(torch.utils.data.Dataset):
         """
         加载用户序列数据和每一行的文件偏移量(预处理好的), 用于快速随机访问数据并I/O
         """
-        self.data_file_path = self.data_dir / "seq.jsonl"
+        self.data_file = open(self.data_dir / "seq.jsonl", 'rb')
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
-        # 为多进程准备，每个worker会有自己的文件句柄
-        self._worker_init_fn = self._init_worker
 
     def _load_user_data(self, uid):
         """
@@ -74,29 +72,10 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             data: 用户序列数据，格式为[(user_id, item_id, user_feat, item_feat, action_type, timestamp)]
         """
-        # 每个worker进程都有自己的文件句柄
-        if not hasattr(self, 'data_file') or self.data_file is None:
-            self.data_file = open(self.data_file_path, 'rb')
-        
         self.data_file.seek(self.seq_offsets[uid])
         line = self.data_file.readline()
         data = json.loads(line)
         return data
-    
-    def _init_worker(self, worker_id):
-        """
-        初始化worker进程，每个worker都有自己的文件句柄
-        """
-        # 确保每个worker都有自己的文件句柄
-        if hasattr(self, 'data_file'):
-            self.data_file = None
-    
-    def __del__(self):
-        """
-        析构函数，关闭文件句柄
-        """
-        if hasattr(self, 'data_file') and self.data_file is not None:
-            self.data_file.close()
 
     def _random_neq(self, l, r, s):
         """
@@ -256,84 +235,6 @@ class MyDataset(torch.utils.data.Dataset):
 
         return feat_default_value, feat_types, feat_statistics
 
-    def feat2tensor(self, seq_feature, k):
-        """
-        将特征转换为tensor格式，支持array类型和sparse类型
-        
-        Args:
-            seq_feature: 序列特征list，每个元素为当前时刻的特征字典，形状为 [batch_size, maxlen]
-            k: 特征ID
-
-        Returns:
-            batch_data: 特征值的tensor，形状为 [batch_size, maxlen, max_array_len(if array)]
-        """
-        batch_size = len(seq_feature)
-
-        if k in self.feature_types['item_array'] or k in self.feature_types['user_array']:
-            # 如果特征是Array类型，需要先对array进行padding，然后转换为tensor
-            max_array_len = 0
-            max_seq_len = 0
-
-            for i in range(batch_size):
-                seq_data = [item[k] for item in seq_feature[i]]
-                max_seq_len = max(max_seq_len, len(seq_data))
-                max_array_len = max(max_array_len, max(len(item_data) for item_data in seq_data))
-
-            batch_data = np.zeros((batch_size, max_seq_len, max_array_len), dtype=np.int64)
-            for i in range(batch_size):
-                seq_data = [item[k] for item in seq_feature[i]]
-                for j, item_data in enumerate(seq_data):
-                    actual_len = min(len(item_data), max_array_len)
-                    batch_data[i, j, :actual_len] = item_data[:actual_len]
-
-            return torch.from_numpy(batch_data)
-        elif k in self.feature_types['item_emb']:
-            # 如果特征是多模态嵌入特征，使用float32类型
-            max_seq_len = max(len(seq_feature[i]) for i in range(batch_size))
-            emb_dim = list(self.mm_emb_dict[k].values())[0].shape[0]
-            batch_data = np.zeros((batch_size, max_seq_len, emb_dim), dtype=np.float32)
-
-            for i in range(batch_size):
-                seq_data = [item[k] for item in seq_feature[i]]
-                for j, emb_data in enumerate(seq_data):
-                    if isinstance(emb_data, np.ndarray):
-                        batch_data[i, j] = emb_data
-                    else:
-                        batch_data[i, j] = np.zeros(emb_dim, dtype=np.float32)
-
-            return torch.from_numpy(batch_data)
-        else:
-            # 如果特征是Sparse类型或continual类型，需要处理不同长度的序列
-            max_seq_len = max(len(seq_feature[i]) for i in range(batch_size))
-            
-            # 对于continual特征，使用float32类型
-            if k in self.feature_types['item_continual'] or k in self.feature_types['user_continual']:
-                batch_data = np.zeros((batch_size, max_seq_len), dtype=np.float32)
-            else:
-                batch_data = np.zeros((batch_size, max_seq_len), dtype=np.int64)
-
-            for i in range(batch_size):
-                seq_data = [item[k] for item in seq_feature[i]]
-                # 确保序列长度不超过最大长度
-                if len(seq_data) <= max_seq_len:
-                    # 将seq_data转换为numpy数组
-                    seq_data_array = np.array(seq_data, dtype=batch_data.dtype)
-                    if seq_data_array.ndim == 1:
-                        batch_data[i, :len(seq_data)] = seq_data_array
-                    else:
-                        # 如果是多维数据，展平处理
-                        flattened = seq_data_array.flatten()
-                        batch_data[i, :len(seq_data)] = flattened[:len(seq_data)]
-                else:
-                    seq_data_array = np.array(seq_data, dtype=batch_data.dtype)
-                    if seq_data_array.ndim == 1:
-                        batch_data[i] = seq_data_array[:max_seq_len]
-                    else:
-                        flattened = seq_data_array.flatten()
-                        batch_data[i] = flattened[:max_seq_len]
-
-            return torch.from_numpy(batch_data)
-
     def fill_missing_feat(self, feat, item_id):
         """
         对于原始数据中缺失的特征进行填充缺省值
@@ -364,7 +265,8 @@ class MyDataset(torch.utils.data.Dataset):
 
         return filled_feat
 
-    def collate_fn(self, batch):
+    @staticmethod
+    def collate_fn(batch):
         """
         Args:
             batch: 多个__getitem__返回的数据
@@ -375,9 +277,9 @@ class MyDataset(torch.utils.data.Dataset):
             neg: 负样本ID, torch.Tensor形式
             token_type: 用户序列类型, torch.Tensor形式
             next_token_type: 下一个token类型, torch.Tensor形式
-            seq_feat_processed: 预处理后的用户序列特征字典
-            pos_feat_processed: 预处理后的正样本特征字典
-            neg_feat_processed: 预处理后的负样本特征字典
+            seq_feat: 用户序列特征, list形式
+            pos_feat: 正样本特征, list形式
+            neg_feat: 负样本特征, list形式
         """
         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = zip(*batch)
         seq = torch.from_numpy(np.array(seq))
@@ -386,28 +288,10 @@ class MyDataset(torch.utils.data.Dataset):
         token_type = torch.from_numpy(np.array(token_type))
         next_token_type = torch.from_numpy(np.array(next_token_type))
         next_action_type = torch.from_numpy(np.array(next_action_type))
-        
-        # 将特征list转换为batch格式并预处理为tensor
         seq_feat = list(seq_feat)
         pos_feat = list(pos_feat)
         neg_feat = list(neg_feat)
-        
-        # 预处理特征为tensor格式
-        seq_feat_processed = {}
-        pos_feat_processed = {}
-        neg_feat_processed = {}
-        
-        # 处理所有特征类型
-        all_feat_types = []
-        for feat_type_list in self.feature_types.values():
-            all_feat_types.extend(feat_type_list)
-        
-        for k in all_feat_types:
-            seq_feat_processed[k] = self.feat2tensor(seq_feat, k)
-            pos_feat_processed[k] = self.feat2tensor(pos_feat, k)
-            neg_feat_processed[k] = self.feat2tensor(neg_feat, k)
-        
-        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat_processed, pos_feat_processed, neg_feat_processed
+        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
 
 
 class MyTestDataset(MyDataset):
@@ -419,11 +303,9 @@ class MyTestDataset(MyDataset):
         super().__init__(data_dir, args)
 
     def _load_data_and_offsets(self):
-        self.data_file_path = self.data_dir / "predict_seq.jsonl"
+        self.data_file = open(self.data_dir / "predict_seq.jsonl", 'rb')
         with open(Path(self.data_dir, 'predict_seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
-        # 为多进程准备，每个worker会有自己的文件句柄
-        self._worker_init_fn = self._init_worker
 
     def _process_cold_start_feat(self, feat):
         """
@@ -516,7 +398,8 @@ class MyTestDataset(MyDataset):
             temp = pickle.load(f)
         return len(temp)
 
-    def collate_fn(self, batch):
+    @staticmethod
+    def collate_fn(batch):
         """
         将多个__getitem__返回的数据拼接成一个batch
 
@@ -526,26 +409,15 @@ class MyTestDataset(MyDataset):
         Returns:
             seq: 用户序列ID, torch.Tensor形式
             token_type: 用户序列类型, torch.Tensor形式
-            seq_feat_processed: 预处理后的用户序列特征字典
+            seq_feat: 用户序列特征, list形式
             user_id: user_id, str
         """
         seq, token_type, seq_feat, user_id = zip(*batch)
         seq = torch.from_numpy(np.array(seq))
         token_type = torch.from_numpy(np.array(token_type))
         seq_feat = list(seq_feat)
-        
-        # 预处理特征为tensor格式
-        seq_feat_processed = {}
-        
-        # 处理所有特征类型
-        all_feat_types = []
-        for feat_type_list in self.feature_types.values():
-            all_feat_types.extend(feat_type_list)
-        
-        for k in all_feat_types:
-            seq_feat_processed[k] = self.feat2tensor(seq_feat, k)
 
-        return seq, token_type, seq_feat_processed, user_id
+        return seq, token_type, seq_feat, user_id
 
 
 def save_emb(emb, save_path):

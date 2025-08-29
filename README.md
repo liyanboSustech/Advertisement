@@ -1,2 +1,0 @@
-# Advtisement
-contest
