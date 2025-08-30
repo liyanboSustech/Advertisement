@@ -200,7 +200,7 @@ class BaselineModel(torch.nn.Module):
         neg_embs = self.feat2emb(neg_seqs, neg_feat, include_user=False)
         return log_feats, pos_embs, neg_embs, loss_mask
     
-    def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask):
+    def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask,writer):
         hidden_size = neg_embs.size(-1)
         
         seq_embs_normalized = F.normalize(seq_embs, p=2, dim=-1)
@@ -208,10 +208,11 @@ class BaselineModel(torch.nn.Module):
         neg_embs_normalized = F.normalize(neg_embs, p=2, dim=-1)
         
         pos_logits = (seq_embs_normalized * pos_embs_normalized).sum(dim=-1).unsqueeze(-1)
-        
+        writer.add_scalar("Model/nce_pos_logits", pos_logits.mean().item())
+    # 
         neg_embedding_all = neg_embs_normalized.view(-1, hidden_size)
         neg_logits = torch.matmul(seq_embs_normalized, neg_embedding_all.transpose(-1, -2))
-        
+        writer.add_scalar("Model/nce_neg_logits", neg_logits.mean().item())
         logits = torch.cat([pos_logits, neg_logits], dim=-1)
         
         masked_logits = logits[loss_mask.bool()] / self.temp

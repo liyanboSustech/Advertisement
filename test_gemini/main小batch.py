@@ -55,14 +55,24 @@ if __name__ == '__main__':
     data_path = os.environ.get('TRAIN_DATA_PATH')
 
     args = get_args()
+    # Subset the dataset to take only 200 samples
+    subset_size = 200
     dataset = MyDataset(data_path, args)
-    train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
+
+    # If you want to take the first 200 samples
+    subset_indices = list(range(subset_size))
+    subset_dataset = torch.utils.data.Subset(dataset, subset_indices)
+
+    # Split the subset dataset into train and validation
+    train_dataset, valid_dataset = torch.utils.data.random_split(subset_dataset, [int(0.9 * subset_size), int(0.1 * subset_size)])
+
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=dataset.collate_fn
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn
     )
+
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
 
@@ -71,8 +81,8 @@ if __name__ == '__main__':
     for name, param in model.named_parameters():
         try:
             torch.nn.init.xavier_normal_(param.data)
-        except Exception:
-            pass
+        except:
+            pass 
 
     model.pos_emb.weight.data[0, :] = 0
     model.item_emb.weight.data[0, :] = 0
@@ -112,7 +122,7 @@ if __name__ == '__main__':
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
             )
             
-            loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask,writer)
+            loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask)
             optimizer.zero_grad()
             # L2 regularization on item embeddings
             for param in model.item_emb.parameters():
@@ -126,7 +136,6 @@ if __name__ == '__main__':
             )
             log_file.write(log_json + '\n')
             log_file.flush()
-            print(log_json)
 
             writer.add_scalar('Loss/train', loss.item(), global_step)
             global_step += 1
@@ -142,7 +151,7 @@ if __name__ == '__main__':
                     seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
                 )
                 
-                loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask,writer)
+                loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask)
                 valid_loss_sum += loss.item()
         
         valid_loss = valid_loss_sum / len(valid_loader)
