@@ -1,10 +1,4 @@
 def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask):
-        """
-        seq_embs: [B, D] sequence embeddings
-        pos_embs: [B, D] positive embeddings
-        neg_embs: [B, N, D] negative embeddings
-        loss_mask: [B] mask to filter valid samples
-        """
         hidden_size = neg_embs.size(-1)
 
         # L2 normalization
