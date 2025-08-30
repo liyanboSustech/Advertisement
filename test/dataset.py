@@ -58,9 +58,11 @@ class MyDataset(torch.utils.data.Dataset):
         """
         加载用户序列数据和每一行的文件偏移量(预处理好的), 用于快速随机访问数据并I/O
         """
-        self.data_file = open(self.data_dir / "seq.jsonl", 'rb')
+        self.data_file_path = self.data_dir / "seq.jsonl"
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
+        # 为多进程准备，每个worker会有自己的文件句柄
+        self._worker_init_fn = self._init_worker
 
     def _load_user_data(self, uid):
         """
@@ -72,10 +74,29 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             data: 用户序列数据，格式为[(user_id, item_id, user_feat, item_feat, action_type, timestamp)]
         """
+        # 每个worker进程都有自己的文件句柄
+        if not hasattr(self, 'data_file') or self.data_file is None:
+            self.data_file = open(self.data_file_path, 'rb')
+        
         self.data_file.seek(self.seq_offsets[uid])
         line = self.data_file.readline()
         data = json.loads(line)
         return data
+    
+    def _init_worker(self, worker_id):
+        """
+        初始化worker进程，每个worker都有自己的文件句柄
+        """
+        # 确保每个worker都有自己的文件句柄
+        if hasattr(self, 'data_file'):
+            self.data_file = None
+    
+    def __del__(self):
+        """
+        析构函数，关闭文件句柄
+        """
+        if hasattr(self, 'data_file') and self.data_file is not None:
+            self.data_file.close()
 
     def _random_neq(self, l, r, s):
         """
