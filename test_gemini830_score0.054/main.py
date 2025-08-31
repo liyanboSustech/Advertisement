@@ -120,7 +120,6 @@ if __name__ == '__main__':
 
             loss.backward()
             optimizer.step()
-
             log_json = json.dumps(
                 {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': time.time()}
             )
