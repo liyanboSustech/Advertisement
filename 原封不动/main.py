@@ -73,6 +73,10 @@ if __name__ == '__main__':
     model.pos_emb.weight.data[0, :] = 0
     model.item_emb.weight.data[0, :] = 0
     model.user_emb.weight.data[0, :] = 0
+# In the provided code snippet, the variable `p`
+# is being used in the following line to
+# calculate the total number of parameters in the
+# model:
 
     for k in model.sparse_emb:
         model.sparse_emb[k].weight.data[0, :] = 0
