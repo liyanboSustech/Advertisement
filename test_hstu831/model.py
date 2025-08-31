@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 
 import numpy as np
 import torch
@@ -8,317 +9,115 @@ from tqdm import tqdm
 from dataset import save_emb
 
 
-# class RotaryPositionalEncoding(torch.nn.Module):
-#     """
-#     Rotary Positional Encoding (RoPE) implementation
-#     """
-#     def __init__(self, dim, max_seq_len=512):
-#         super().__init__()
-#         self.dim = dim
-#         self.max_seq_len = max_seq_len
-        
-#         # Create frequency tensor
-#         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-#         self.register_buffer('inv_freq', inv_freq)
-        
-#         # Create position tensor
-#         position = torch.arange(max_seq_len, dtype=torch.float)
-#         self.register_buffer('position', position)
-        
-#     def forward(self, x):
-#         """
-#         Apply rotary encoding to input tensor
-        
-#         Args:
-#             x: input tensor of shape [batch_size, seq_len, dim]
-        
-#         Returns:
-#             rotary encoded tensor
-#         """
-#         seq_len = x.size(1)
-        
-#         # Calculate frequencies for each position
-#         freqs = torch.outer(self.position[:seq_len], self.inv_freq)
-        
-#         # Create rotation matrix
-#         cos_freqs = torch.cos(freqs)  # [seq_len, dim//2]
-#         sin_freqs = torch.sin(freqs)  # [seq_len, dim//2]
-        
-#         # Apply rotation to input
-#         x_rot = self.rotate_half(x)
-        
-#         # Apply rotary encoding
-#         x = x * cos_freqs.unsqueeze(0) + x_rot * sin_freqs.unsqueeze(0)
-        
-#         return x
-    
-#     def rotate_half(self, x):
-#         """
-#         Rotate half of the dimensions for rotary encoding
-#         """
-#         x1, x2 = x.chunk(2, dim=-1)
-#         return torch.cat([-x2, x1], dim=-1)
-class RotaryPositionalEncoding(torch.nn.Module):
-    """
-    修正维度匹配问题的 Rotary Positional Encoding (RoPE) 实现
-    """
-    def __init__(self, dim, max_seq_len=512):
-        super().__init__()
-        self.dim = dim  # 这里的 dim 是单头注意力维度（head_dim）
+class RoPE(torch.nn.Module):
+    """Rotary Position Embedding implementation"""
+    def __init__(self, dim, max_seq_len=8192, base=10000):
+        super(RoPE, self).__init__()
+        self.dim = dim
         self.max_seq_len = max_seq_len
+        self.base = base
         
-        # 1. 生成频率张量（原始逻辑不变，频率维度为 dim//2）
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        # Precompute theta values
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
         
-        # 2. 生成位置张量（原始逻辑不变）
-        position = torch.arange(max_seq_len, dtype=torch.float)
-        self.register_buffer('position', position)
-        
-    def forward(self, x):
-        """
-        应用旋转编码到输入张量
-        Args:
-            x: 输入张量，形状为 [batch_size, num_heads, seq_len, head_dim]
-        Returns:
-            旋转编码后的张量（与输入形状一致）
-        """
-        seq_len = x.size(2)  # 注意：输入形状变为 [B, H, S, D]，seq_len 在第 2 维
-        
-        # 3. 计算每个位置的频率（形状：[seq_len, dim//2]）
-        freqs = torch.outer(self.position[:seq_len], self.inv_freq)
-        
-        # 4. 生成旋转矩阵的 cos/sin 分量（形状：[seq_len, dim//2]）
-        cos_freqs = torch.cos(freqs)
-        sin_freqs = torch.sin(freqs)
-        
-        # 5. 关键修正：将 cos/sin 扩展到与输入最后一维（head_dim）匹配
-        # 因为输入最后一维会被拆分为两半，所以需要将 cos/sin 重复 2 次（dim//2 * 2 = dim）
-        cos_freqs = cos_freqs.unsqueeze(-1).repeat(1, 1, 2)  # [seq_len, dim//2, 2] → 展平后 [seq_len, dim]
-        sin_freqs = sin_freqs.unsqueeze(-1).repeat(1, 1, 2)
-        cos_freqs = cos_freqs.view(seq_len, self.dim)  # [seq_len, dim]
-        sin_freqs = sin_freqs.view(seq_len, self.dim)  # [seq_len, dim]
-        
-        # 6. 对输入进行半维度旋转（原始逻辑不变）
-        x_rot = self.rotate_half(x)
-        
-        # 7. 应用旋转编码：注意输入形状为 [B, H, S, D]，需调整 cos/sin 的维度
-        # 给 cos/sin 添加 batch 和 head 维度的 singleton 维度，确保广播兼容
-        x = x * cos_freqs.unsqueeze(0).unsqueeze(0)  # [B,H,S,D] * [1,1,S,D] → 广播后匹配
-        x_rot = x_rot * sin_freqs.unsqueeze(0).unsqueeze(0)
-        x = x + x_rot
-        
-        return x
-    
+        # Precompute cos and sin tables
+        t = torch.arange(max_seq_len).type_as(self.inv_freq)
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer('cos_cached', emb.cos()[None, None, :, :])
+        self.register_buffer('sin_cached', emb.sin()[None, None, :, :])
+
     def rotate_half(self, x):
-        """
-        将输入的最后一维拆分为两半，并旋转后一半（修正输入形状适配）
-        输入 x 形状：[batch_size, num_heads, seq_len, head_dim]
-        输出形状：与输入一致
-        """
-        x1, x2 = x.chunk(2, dim=-1)  # 最后一维拆分为两半（各为 head_dim//2）
-        return torch.cat([-x2, x1], dim=-1)  # 旋转后合并，恢复为 head_dim 维度
+        """Rotates half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def forward(self, q, k, seq_len=None):
+        if seq_len is None:
+            seq_len = q.shape[-2]
+        
+        cos = self.cos_cached[:, :, :seq_len, :]
+        sin = self.sin_cached[:, :, :seq_len, :]
+        
+        q_embed = (q * cos) + (self.rotate_half(q) * sin)
+        k_embed = (k * cos) + (self.rotate_half(k) * sin)
+        return q_embed, k_embed
 
 
-class HSTUAttention(torch.nn.Module):
-    """
-    Hierarchical Spatial-Temporal Unit (HSTU) Attention mechanism
-    Based on ICML 2024 paper "Actions Speak Louder than Words"
-    """
-    def __init__(self, hidden_units, num_heads, dropout_rate, max_seq_len=512):
-        super(HSTUAttention, self).__init__()
+class HSTU(torch.nn.Module):
+    """Hierarchical Sequential Transduction Unit (HSTU) Layer"""
+    def __init__(self, hidden_units, num_heads, dropout_rate):
+        super(HSTU, self).__init__()
         self.hidden_units = hidden_units
         self.num_heads = num_heads
         self.head_dim = hidden_units // num_heads
         self.dropout_rate = dropout_rate
-        self.max_seq_len = max_seq_len
         
         assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
         
-        # Linear projections for Q, K, V
-        self.q_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.k_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
+        # Pointwise Projection (Equation 1 in paper)
+        # Split linear layer into U, V, Q, K components
+        self.pointwise_proj = torch.nn.Linear(hidden_units, 4 * hidden_units)
         
-        # Rotary Positional Encoding
-        self.rope = RotaryPositionalEncoding(self.head_dim, max_seq_len)
+        # RoPE for positional encoding
+        self.rope = RoPE(self.head_dim)
         
-        # Hierarchical temporal aggregation
-        self.temporal_scale = 4  # Number of temporal scales
-        self.temporal_weights = torch.nn.Parameter(torch.ones(self.temporal_scale) / self.temporal_scale)
+        # Layer normalization (applied after spatial aggregation)
+        self.layer_norm = torch.nn.LayerNorm(hidden_units, eps=1e-8)
         
-        # Spatial feature fusion
-        self.spatial_gate = torch.nn.Linear(hidden_units, hidden_units)
-        self.spatial_norm = torch.nn.LayerNorm(hidden_units)
+        # Pointwise Transformation (Equation 3 in paper)
+        self.pointwise_transform = torch.nn.Linear(hidden_units, hidden_units)
+        self.dropout = torch.nn.Dropout(p=dropout_rate)
+
+    def forward(self, x, attn_mask=None):
+        batch_size, seq_len, _ = x.size()
+        residual = x
         
-        # Dropout
-        self.dropout = torch.nn.Dropout(dropout_rate)
-        
-    def hierarchical_temporal_aggregation(self, x):
-        """
-        Apply hierarchical temporal aggregation at multiple scales
-        Input x shape: [batch_size, num_heads, seq_len, head_dim]
-        """
-        batch_size, num_heads, seq_len, head_dim = x.shape
-        temporal_features = []
-        
-        for scale in range(self.temporal_scale):
-            # Calculate pooling size for this scale
-            pool_size = max(1, seq_len // (2 ** scale))
-            
-            # Apply adaptive pooling to get fixed-size representation
-            if scale == 0:
-                # Original scale
-                scale_feat = x
-            else:
-                # Downsampled scale - reshape for pooling
-                # Reshape to [batch_size * num_heads, head_dim, seq_len] for pooling
-                x_reshaped = x.view(batch_size * num_heads, head_dim, seq_len)
-                scale_feat = F.adaptive_avg_pool1d(x_reshaped, pool_size)
-                scale_feat = scale_feat.view(batch_size, num_heads, head_dim, pool_size).transpose(-2, -1)
-            
-            # Upsample back to original length if needed
-            if scale_feat.size(2) < seq_len:
-                # Reshape for interpolation: [batch_size * num_heads, head_dim, current_seq_len]
-                scale_feat_reshaped = scale_feat.transpose(-2, -1).contiguous().view(batch_size * num_heads, head_dim, -1)
-                scale_feat_interp = F.interpolate(scale_feat_reshaped, size=seq_len, mode='linear', align_corners=False)
-                scale_feat = scale_feat_interp.view(batch_size, num_heads, head_dim, seq_len).transpose(-2, -1)
-            
-            temporal_features.append(scale_feat)
-        
-        # Weighted aggregation across temporal scales
-        temporal_features = torch.stack(temporal_features, dim=0)  # [temporal_scale, batch_size, num_heads, seq_len, head_dim]
-        weights = F.softmax(self.temporal_weights, dim=0).view(-1, 1, 1, 1, 1)
-        aggregated = (temporal_features * weights).sum(dim=0)
-        
-        return aggregated
-    
-    def spatial_feature_fusion(self, query, key, value):
-        """
-        Apply spatial feature fusion with gating mechanism
-        Input shapes: [batch_size, num_heads, seq_len, head_dim]
-        """
-        # Compute spatial attention scores
-        spatial_scores = torch.matmul(query, key.transpose(-2, -1))
-        spatial_scores = spatial_scores / (self.head_dim ** 0.5)
-        
-        # Apply spatial gating - need to reshape for gate computation
-        batch_size, num_heads, seq_len, head_dim = query.shape
-        query_flat = query.view(batch_size, seq_len, num_heads * head_dim)
-        gate = torch.sigmoid(self.spatial_gate(query_flat))
-        gate = gate.view(batch_size, num_heads, seq_len, head_dim)
-        
-        # Apply gate to spatial scores
-        spatial_scores = spatial_scores * gate.mean(dim=-1, keepdim=True)
-        
-        return spatial_scores
-    
-    def forward(self, query, key, value, attn_mask=None):
-        batch_size, seq_len, _ = query.size()
-        
-        # Linear projections
-        Q = self.q_linear(query)
-        K = self.k_linear(key)
-        V = self.v_linear(value)
+        # Pointwise Projection (Equation 1): U(X), V(X), Q(X), K(X) = Split(φ₁(f₁(X)))
+        proj = self.pointwise_proj(x)  # [B, L, 4*D]
+        U, V, Q, K = torch.chunk(proj, 4, dim=-1)  # Each: [B, L, D]
         
         # Reshape for multi-head attention
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, L, D/H]
+        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, L, D/H]
+        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, L, D/H]
         
-        # Apply Rotary Positional Encoding
-        Q = self.rope(Q)
-        K = self.rope(K)
+        # Apply RoPE to Q and K
+        Q_rope, K_rope = self.rope(Q, K, seq_len)
         
-        # Hierarchical temporal aggregation (now handles 4D tensors correctly)
-        Q = self.hierarchical_temporal_aggregation(Q)
-        K = self.hierarchical_temporal_aggregation(K)
-        V = self.hierarchical_temporal_aggregation(V)
+        # Spatial Aggregation (Equation 2): A(X)V(X) = φ₂(softmax(Q(X)K(X)ᵀ))V(X)
+        # Using pointwise attention instead of softmax as described in the paper
+        scale = (self.head_dim) ** -0.5
+        scores = torch.matmul(Q_rope, K_rope.transpose(-2, -1)) * scale  # [B, H, L, L]
         
-        # Compute attention with spatial fusion
-        if hasattr(F, 'scaled_dot_product_attention'):
-            # Use efficient scaled dot product attention if available
-            attn_output = F.scaled_dot_product_attention(
-                Q, K, V, 
-                dropout_p=self.dropout_rate if self.training else 0.0, 
-                attn_mask=attn_mask.unsqueeze(1) if attn_mask is not None else None
-            )
-        else:
-            # Manual attention computation
-            scale = (self.head_dim) ** -0.5
-            scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
-            
-            if attn_mask is not None:
-                scores.masked_fill_(attn_mask.unsqueeze(1).logical_not(), float('-inf'))
-            
-            attn_weights = F.softmax(scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            attn_output = torch.matmul(attn_weights, V)
+        if attn_mask is not None:
+            scores.masked_fill_(attn_mask.unsqueeze(1).logical_not(), float('-inf'))
         
-        # Reshape back
+        # Pointwise aggregated attention (no softmax normalization)
+        # Using sigmoid activation for pointwise aggregation as suggested in paper
+        attn_weights = torch.sigmoid(scores)
+        attn_weights = F.dropout(attn_weights, p=self.dropout_rate, training=self.training)
+        
+        attn_output = torch.matmul(attn_weights, V)  # [B, H, L, D/H]
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
         
-        # Apply spatial normalization
-        attn_output = self.spatial_norm(attn_output)
+        # Apply layer normalization after spatial aggregation
+        attn_output = self.layer_norm(attn_output)
         
-        # Final projection
-        output = self.out_linear(attn_output)
+        # Element-wise gating with U (inspired by SwiGLU)
+        U = U.view(batch_size, seq_len, self.hidden_units)
+        gated_output = F.silu(U) * attn_output  # Element-wise multiplication
         
-        return output, None
-
-
-class FlashMultiHeadAttention(torch.nn.Module):
-    def __init__(self, hidden_units, num_heads, dropout_rate):
-        super(FlashMultiHeadAttention, self).__init__()
-        self.hidden_units = hidden_units
-        self.num_heads = num_heads
-        self.head_dim = hidden_units // num_heads
-        self.dropout_rate = dropout_rate
-        assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
-        self.q_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.k_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
-
-    def forward(self, query, key, value, attn_mask=None):
-        batch_size, seq_len, _ = query.size()
-        Q = self.q_linear(query)
-        K = self.k_linear(key)
-        V = self.v_linear(value)
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        if hasattr(F, 'scaled_dot_product_attention'):
-            attn_output = F.scaled_dot_product_attention(
-                Q, K, V, dropout_p=self.dropout_rate if self.training else 0.0, attn_mask=attn_mask.unsqueeze(1)
-            )
-        else:
-            scale = (self.head_dim) ** -0.5
-            scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
-            if attn_mask is not None:
-                scores.masked_fill_(attn_mask.unsqueeze(1).logical_not(), float('-inf'))
-            attn_weights = F.softmax(scores, dim=-1)
-            attn_weights = F.dropout(attn_weights, p=self.dropout_rate, training=self.training)
-            attn_output = torch.matmul(attn_weights, V)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
-        output = self.out_linear(attn_output)
-        return output, None
-
-
-class PointWiseFeedForward(torch.nn.Module):
-    def __init__(self, hidden_units, dropout_rate):
-        super(PointWiseFeedForward, self).__init__()
-        self.conv1 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
-        self.dropout1 = torch.nn.Dropout(p=dropout_rate)
-        self.relu = torch.nn.ReLU()
-        self.conv2 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
-        self.dropout2 = torch.nn.Dropout(p=dropout_rate)
-
-    def forward(self, inputs):
-        outputs = self.dropout2(self.conv2(self.relu(self.dropout1(self.conv1(inputs.transpose(-1, -2))))))
-        outputs = outputs.transpose(-1, -2)
-        return outputs
+        # Pointwise Transformation (Equation 3): φ₃(f₃(A(X)V(X) ⊙ U(X)))
+        output = self.pointwise_transform(gated_output)
+        output = self.dropout(output)
+        
+        # Residual connection
+        output = residual + output
+        
+        return output
 
 
 class BaselineModel(torch.nn.Module):
@@ -331,20 +130,19 @@ class BaselineModel(torch.nn.Module):
         self.maxlen = args.maxlen
         self.temp = args.temperature
 
-        # Embeddings
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
         
-        # Replace absolute positional encoding with Rotary Positional Encoding
-        self.rope = RotaryPositionalEncoding(args.hidden_units, max_seq_len=2 * args.maxlen + 1)
+        # Remove absolute position embedding as we're using RoPE
+        # self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
         
         self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
         self.sparse_emb = torch.nn.ModuleDict()
         self.emb_transform = torch.nn.ModuleDict()
-        self.attention_layernorms = torch.nn.ModuleList()
-        self.attention_layers = torch.nn.ModuleList()  # Will use HSTUAttention
-        self.forward_layernorms = torch.nn.ModuleList()
-        self.forward_layers = torch.nn.ModuleList()
+        
+        # Replace attention and forward layers with HSTU layers
+        self.hstu_layers = torch.nn.ModuleList()
+        
         self._init_feat_info(feat_statistics, feat_types)
 
         userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(self.USER_CONTINUAL_FEAT)
@@ -354,14 +152,11 @@ class BaselineModel(torch.nn.Module):
         self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
         self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
 
-        # Use HSTU Attention layers instead of FlashMultiHeadAttention
+        # Initialize HSTU layers
         for _ in range(args.num_blocks):
-            self.attention_layernorms.append(torch.nn.LayerNorm(args.hidden_units, eps=1e-8))
-            self.attention_layers.append(HSTUAttention(args.hidden_units, args.num_heads, args.dropout_rate, max_seq_len=2 * args.maxlen + 1))
-            self.forward_layernorms.append(torch.nn.LayerNorm(args.hidden_units, eps=1e-8))
-            self.forward_layers.append(PointWiseFeedForward(args.hidden_units, args.dropout_rate))
+            self.hstu_layers.append(HSTU(args.hidden_units, args.num_heads, args.dropout_rate))
 
-        # Feature embeddings
+        # Initialize sparse embeddings
         for k in self.USER_SPARSE_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_SPARSE_FEAT:
@@ -435,26 +230,18 @@ class BaselineModel(torch.nn.Module):
         seqs = self.feat2emb(log_seqs, seq_feature_tensors, mask=mask, include_user=True)
         seqs *= self.item_emb.embedding_dim**0.5
         
-        # Apply Rotary Positional Encoding instead of absolute positional encoding
-        # Note: HSTUAttention handles RoPE internally, so we don't need to apply it here
-        
+        # Note: RoPE is applied inside HSTU layers, so we don't need absolute positional embeddings here
         seqs = self.emb_dropout(seqs)
 
+        # Create causal attention mask
         attention_mask = torch.tril(torch.ones((self.maxlen + 1, self.maxlen + 1), dtype=torch.bool, device=self.dev))
         attention_mask = attention_mask.unsqueeze(0).expand(log_seqs.shape[0], -1, -1)
         attention_mask_pad = (mask != 0).to(self.dev)
         attention_mask = attention_mask & attention_mask_pad.unsqueeze(1)
 
-        for i in range(len(self.attention_layers)):
-            if self.norm_first:
-                x = self.attention_layernorms[i](seqs)
-                mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask)
-                seqs = seqs + mha_outputs
-                seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
-            else:
-                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
-                seqs = self.attention_layernorms[i](seqs + mha_outputs)
-                seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
+        # Pass through HSTU layers
+        for hstu_layer in self.hstu_layers:
+            seqs = hstu_layer(seqs, attn_mask=attention_mask)
 
         return self.last_layernorm(seqs)
 
@@ -465,7 +252,7 @@ class BaselineModel(torch.nn.Module):
         neg_embs = self.feat2emb(neg_seqs, neg_feat, include_user=False)
         return log_feats, pos_embs, neg_embs, loss_mask
     
-    def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask,writer):
+    def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask, writer):
         hidden_size = neg_embs.size(-1)
         
         seq_embs_normalized = F.normalize(seq_embs, p=2, dim=-1)
@@ -474,7 +261,7 @@ class BaselineModel(torch.nn.Module):
         
         pos_logits = (seq_embs_normalized * pos_embs_normalized).sum(dim=-1).unsqueeze(-1)
         writer.add_scalar("Model/nce_pos_logits", pos_logits.mean().item())
-    # 
+        
         neg_embedding_all = neg_embs_normalized.view(-1, hidden_size)
         neg_logits = torch.matmul(seq_embs_normalized, neg_embedding_all.transpose(-1, -2))
         writer.add_scalar("Model/nce_neg_logits", neg_logits.mean().item())
