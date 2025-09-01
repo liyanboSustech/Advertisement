@@ -16,8 +16,10 @@ class TemporalFeatureExtractor:
     @staticmethod
     def extract_time_features(timestamps):
         """从时间戳提取多种时间特征"""
-        time_features = {}
+        if isinstance(timestamps, (int, float)):
+            timestamps = [timestamps]   # ✅ 兼容单个值
         
+        time_features = {}
         for i, ts in enumerate(timestamps):
             if ts is None:
                 time_features[i] = {
@@ -28,15 +30,14 @@ class TemporalFeatureExtractor:
                     'month_sin': 0.0, 'month_cos': 1.0
                 }
                 continue
-                
+
             dt = datetime.fromtimestamp(ts)
-            
             hour = dt.hour
             day_of_week = dt.weekday()
             day_of_month = dt.day
             month = dt.month
             is_weekend = 1 if day_of_week >= 5 else 0
-            
+
             # 周期性编码
             time_of_day_sin = math.sin(2 * math.pi * hour / 24)
             time_of_day_cos = math.cos(2 * math.pi * hour / 24)
@@ -44,7 +45,7 @@ class TemporalFeatureExtractor:
             day_of_week_cos = math.cos(2 * math.pi * day_of_week / 7)
             month_sin = math.sin(2 * math.pi * month / 12)
             month_cos = math.cos(2 * math.pi * month / 12)
-            
+
             time_features[i] = {
                 'hour': hour,
                 'day_of_week': day_of_week,
@@ -58,13 +59,14 @@ class TemporalFeatureExtractor:
                 'month_sin': month_sin,
                 'month_cos': month_cos
             }
-        
         return time_features
     
     @staticmethod
     def extract_relative_time_features(timestamps):
         """提取相对时间特征"""
         relative_features = {}
+        if isinstance(timestamps, (int, float)):
+            timestamps = [timestamps]   # 兼容单个值
         
         for i in range(len(timestamps)):
             if i == 0 or timestamps[i] is None or timestamps[i-1] is None:
@@ -75,17 +77,13 @@ class TemporalFeatureExtractor:
                 }
             else:
                 time_diff = timestamps[i] - timestamps[i-1]
-                time_since_last = float(time_diff)
-                time_since_last_log = math.log(max(1, time_diff))
-                time_since_last_hours = time_diff / 3600.0  # 转换为小时
-                
                 relative_features[i] = {
-                    'time_since_last': time_since_last,
-                    'time_since_last_log': time_since_last_log,
-                    'time_since_last_hours': time_since_last_hours
+                    'time_since_last': float(time_diff),
+                    'time_since_last_log': math.log(max(1, time_diff)),
+                    'time_since_last_hours': time_diff / 3600.0
                 }
-        
         return relative_features
+
 
 
 class TemporalSENet(torch.nn.Module):
@@ -376,9 +374,14 @@ class BaselineModel(torch.nn.Module):
             # 只处理当前序列位置的时间特征（通常是最后一个位置）
             current_ts = timestamps[-1] if isinstance(timestamps, list) else timestamps
             if current_ts is not None:
-                time_feats = self.temporal_extractor.extract_time_features([current_ts])
-                relative_feats = self.temporal_extractor.extract_relative_time_features(timestamps if isinstance(timestamps, list) else [current_ts])
-                
+                time_feats = self.temporal_extractor.extract_time_features(current_ts)
+                if timestamps is not None:
+                    relative_feats = torch.stack([
+                        self.temporal_extractor.extract_relative_time_features(ts) for ts in timestamps
+                    ])
+                else:
+                    relative_feats = torch.zeros(seq.shape[0], self.hidden_units).to(seq.device)
+
                 # 合并时间特征
                 temporal_features = {}
                 if 0 in time_feats:
