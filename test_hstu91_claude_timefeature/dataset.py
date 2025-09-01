@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import json
 import pickle
 import struct
@@ -7,6 +8,33 @@ import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
+
+
+def load_mm_emb(mm_path, feat_ids):
+    SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
+    mm_emb_dict = {}
+    for feat_id in tqdm(feat_ids, desc='Loading mm_emb'):
+        shape = SHAPE_DICT[feat_id]
+        emb_dict = {}
+        if feat_id != '81':
+            try:
+                base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
+                for json_file in base_path.glob('*.json'):
+                    with open(json_file, 'r', encoding='utf-8') as file:
+                        for line in file:
+                            data = json.loads(line.strip())
+                            emb = data['emb']
+                            if isinstance(emb, list):
+                                emb = np.array(emb, dtype=np.float32)
+                            emb_dict[data['anonymous_cid']] = emb
+            except Exception as e:
+                print(f"transfer error: {e}")
+        else:
+            with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
+                emb_dict = pickle.load(f)
+        mm_emb_dict[feat_id] = emb_dict
+        print(f'Loaded #{feat_id} mm_emb')
+    return mm_emb_dict
 
 
 class MyDataset(torch.utils.data.Dataset):
@@ -58,38 +86,44 @@ class MyDataset(torch.utils.data.Dataset):
             t = np.random.randint(l, r)
         return t
 
-    def _add_time_features(self, user_sequence):
-        if not user_sequence:
-            return user_sequence
-
+    # =================================================================
+    #  根据图 5 重写 _add_time_features
+    # =================================================================
+    def _add_time_features(self, user_sequence, tau=86400):
         ts_array = np.array([r[5] for r in user_sequence], dtype=np.int64)
+
+        # time_gap, log_gap
         prev_ts_array = np.roll(ts_array, 1)
         prev_ts_array[0] = ts_array[0]
         time_gap = ts_array - prev_ts_array
         time_gap[0] = 0
         log_gap = np.log1p(time_gap)
 
+        # hour, weekday, month
         ts_utc8 = ts_array + 8 * 3600
         hours = (ts_utc8 % 86400) // 3600
-        weekdays = ((ts_utc8 // 86400) + 4) % 7
+        weekdays = ((ts_utc8 // 86400 + 4) % 7).astype(np.int32)
         months = pd.to_datetime(ts_utc8, unit='s').month.to_numpy()
 
+        # time decay
         last_ts = ts_array[-1]
         delta_t = last_ts - ts_array
-        delta_scaled = np.log1p(delta_t / 86400)
+        delta_scaled = np.log1p(delta_t / tau)
 
+        # 添加到 sequence
         new_sequence = []
         for idx, record in enumerate(user_sequence):
             u, i, user_feat, item_feat, action_type, ts = record
-            if item_feat is None:
-                item_feat = {}
-            item_feat["200"] = int(hours[idx])
-            item_feat["201"] = int(weekdays[idx])
-            item_feat["202"] = float(log_gap[idx])
-            item_feat["203"] = int(months[idx])
-            item_feat["204"] = float(delta_scaled[idx])
+            if user_feat is None:
+                user_feat = {}
+            user_feat["200"] = int(hours[idx])
+            user_feat["201"] = int(weekdays[idx])
+            # user_feat["202"] = int(time_gap[idx])
+            user_feat["203"] = float(log_gap[idx])
+            user_feat["204"] = int(months[idx])
+            user_feat["205"] = float(delta_scaled[idx])
             new_sequence.append((u, i, user_feat, item_feat, action_type, ts))
-        return new_sequence
+        return new_sequence  # 小红书号：3893367512
 
     def _features_to_tensors(self, feat_array):
         feature_tensors = {}
@@ -117,6 +151,9 @@ class MyDataset(torch.utils.data.Dataset):
 
         return feature_tensors
 
+    # =================================================================
+    #  根据图 4 重写 __getitem__
+    # =================================================================
     def __getitem__(self, uid):
         user_sequence = self._load_user_data(uid)
         user_sequence = self._add_time_features(user_sequence)
@@ -144,23 +181,37 @@ class MyDataset(torch.utils.data.Dataset):
         idx = self.maxlen
         ts = {record[0] for record in ext_user_sequence if record[2] == 1 and record[0]}
 
+        # -------------------------------------------------------------
+        #  以下 for-loop 完全按照图 4 手写逻辑重写
+        # -------------------------------------------------------------
         for record_tuple in reversed(ext_user_sequence[:-1]):
-            i, feat, type_, act_type = record_tuple
-            next_i, next_feat, next_type, next_act_type = nxt
+            # 当前 token 信息
+            i, u_feat, i_feat, type_, act_type = record_tuple
+            if type_ == 2:
+                continue
+            # 把 user_feat 中的上下文特征转移到 item_feat
+            i_feat = self._transfer_context_features(
+                u_feat, i_feat, ["200", "201", "203", "204"])
+            i_feat = self.fill_missing_feat(i_feat, i)
+
+            # 下一个 token 信息
+            next_i, _, next_feat, next_type, next_act_type = nxt
+            next_feat = self.fill_missing_feat(next_feat, next_i)
 
             seq[idx] = i
+            seq_feat[idx] = i_feat
             token_type[idx] = type_
             next_token_type[idx] = next_type
             if next_act_type is not None:
                 next_action_type[idx] = next_act_type
-            seq_feat[idx] = self.fill_missing_feat(feat, i)
 
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
-                pos_feat[idx] = self.fill_missing_feat(next_feat, next_i)
+                pos_feat[idx] = next_feat
                 neg_id = self._random_neq(1, self.itemnum + 1, ts)
                 neg[idx] = neg_id
-                neg_feat[idx] = self.fill_missing_feat(self.item_feat_dict.get(str(neg_id), {}), neg_id)
+                neg_feat[idx] = self.fill_missing_feat(
+                    self.item_feat_dict.get(str(neg_id), {}), neg_id)
 
             nxt = record_tuple
             idx -= 1
@@ -171,7 +222,8 @@ class MyDataset(torch.utils.data.Dataset):
         pos_feat_tensors = self._features_to_tensors(pos_feat)
         neg_feat_tensors = self._features_to_tensors(neg_feat)
 
-        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat_tensors, pos_feat_tensors, neg_feat_tensors
+        return (seq, pos, neg, token_type, next_token_type, next_action_type,
+                seq_feat_tensors, pos_feat_tensors, neg_feat_tensors)
 
     def __len__(self):
         return len(self.seq_offsets)
@@ -230,6 +282,15 @@ class MyDataset(torch.utils.data.Dataset):
                         emb = np.array(emb, dtype=np.float32)
                     filled_feat[feat_id] = emb
         return filled_feat
+
+    # =================================================================
+    #  根据图 6 增加 _transfer_context_features
+    # =================================================================
+    def _transfer_context_features(self, user_feat: dict, item_feat: dict, cols_to_trans: list):
+        """把 user_feat 中指定列的值直接赋给 item_feat"""
+        for col in cols_to_trans:
+            item_feat[col] = user_feat[col]
+        return item_feat
 
     @staticmethod
     def collate_fn(batch):
@@ -373,7 +434,6 @@ def save_emb(emb, save_path):
         f.write(struct.pack('II', num_points, num_dimensions))
         emb.tofile(f)
 
-
 def load_mm_emb(mm_path, feat_ids):
     SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
     mm_emb_dict = {}
@@ -393,7 +453,7 @@ def load_mm_emb(mm_path, feat_ids):
                             emb_dict[data['anonymous_cid']] = emb
             except Exception as e:
                 print(f"transfer error: {e}")
-        else:
+        else: # feat_id == '81'
             with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
                 emb_dict = pickle.load(f)
         mm_emb_dict[feat_id] = emb_dict
