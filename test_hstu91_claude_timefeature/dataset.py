@@ -29,6 +29,7 @@ class MyDataset(torch.utils.data.Dataset):
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
         print("usernum:", self.usernum, "itemnum:", self.itemnum)
+
     def _load_data_and_offsets(self):
         self.data_file_path = self.data_dir / "seq.jsonl"
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
@@ -180,46 +181,33 @@ class MyDataset(torch.utils.data.Dataset):
         feat_statistics = {}
         feat_types = {}
 
-        # 多模态 embedding 维度
         EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
 
-        # 特征分类
-        feat_types['user_sparse']  = ['103', '104', '105', '109']
-        feat_types['item_sparse']  = [
+        feat_types['user_sparse'] = ['103', '104', '105', '109']
+        feat_types['item_sparse'] = [
             '100', '117', '111', '118', '101', '102', '119', '120', '114', '112', '121',
             '115', '122', '116', '200', '201', '203'
         ]
-        feat_types['item_array']   = []
-        feat_types['user_array']   = ['106', '107', '108', '110']
-        feat_types['item_emb']     = self.mm_emb_ids
-        feat_types['user_continual']  = []
-        feat_types['item_continual']  = ['202', '204']
+        feat_types['item_array'] = []
+        feat_types['user_array'] = ['106', '107', '108', '110']
+        feat_types['item_emb'] = self.mm_emb_ids
+        feat_types['user_continual'] = []
+        feat_types['item_continual'] = ['202', '204']
 
-        # 固定时间特征的 vocab_size（不依赖 indexer）
-        fixed_vocab_size = {
-            '200': 24,  # hour 0~23
-            '201': 7,   # weekday 0~6
-            '203': 13,  # month 1~12（0 作为 padding）
-        }
+        fixed_vocab_size = {'200': 24, '201': 7, '203': 13}
 
-        # 初始化 sparse 特征
         for feat_id in feat_types['user_sparse'] + feat_types['item_sparse']:
             feat_default_value[feat_id] = 0
-            if feat_id in fixed_vocab_size:
-                feat_statistics[feat_id] = fixed_vocab_size[feat_id]
-            else:
-                feat_statistics[feat_id] = len(self.indexer['f'].get(feat_id, {}))
+            feat_statistics[feat_id] = fixed_vocab_size.get(
+                feat_id, len(self.indexer['f'].get(feat_id, {})))
 
-        # 初始化 array 特征
         for feat_id in feat_types['item_array'] + feat_types['user_array']:
             feat_default_value[feat_id] = [0]
             feat_statistics[feat_id] = len(self.indexer['f'].get(feat_id, {}))
 
-        # 初始化 continual 特征
         for feat_id in feat_types['user_continual'] + feat_types['item_continual']:
             feat_default_value[feat_id] = 0.0
 
-        # 初始化多模态 embedding 特征
         for feat_id in feat_types['item_emb']:
             shape = EMB_SHAPE_DICT[feat_id]
             feat_default_value[feat_id] = np.zeros(shape, dtype=np.float32)
@@ -281,7 +269,6 @@ class MyDataset(torch.utils.data.Dataset):
         batched_seq_feat = batch_features(seq_feat)
         batched_pos_feat = batch_features(pos_feat)
         batched_neg_feat = batch_features(neg_feat)
-
         return seq, pos, neg, token_type, next_token_type, next_action_type, batched_seq_feat, batched_pos_feat, batched_neg_feat
 
 

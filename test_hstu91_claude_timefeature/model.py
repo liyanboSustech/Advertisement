@@ -128,19 +128,20 @@ class BaselineModel(torch.nn.Module):
             self.hstu_layers.append(HSTU(args.hidden_units, args.num_heads, args.dropout_rate))
 
         for k in self.USER_SPARSE_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
+            self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k], args.hidden_units, padding_idx=0)
         for k in self.ITEM_SPARSE_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(self.ITEM_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
+            self.sparse_emb[k] = torch.nn.Embedding(self.ITEM_SPARSE_FEAT[k], args.hidden_units, padding_idx=0)
         for k in self.ITEM_ARRAY_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(self.ITEM_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
+            self.sparse_emb[k] = torch.nn.Embedding(self.ITEM_ARRAY_FEAT[k], args.hidden_units, padding_idx=0)
         for k in self.USER_ARRAY_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
+            self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k], args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
         print("USER_SPARSE_FEAT:", self.USER_SPARSE_FEAT)
         print("ITEM_SPARSE_FEAT:", self.ITEM_SPARSE_FEAT)
 
     def _init_feat_info(self, feat_statistics, feat_types):
+        # 【改动】不再 +1，因为 feat_statistics 已包含 padding 位
         self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['user_sparse']}
         self.USER_CONTINUAL_FEAT = feat_types['user_continual']
         self.ITEM_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['item_sparse']}
