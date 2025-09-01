@@ -19,9 +19,9 @@ def get_args():
 
     # Train params
     parser.add_argument('--batch_size', default=128, type=int)
-    parser.add_argument('--lr', default=0.001, type=float)
+    parser.add_argument('--lr', default=0.002, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
-    parser.add_argument('--num_epochs', default=3, type=int)
+    parser.add_argument('--num_epochs', default=5, type=int)
     parser.add_argument('--num_workers', default=4, type=int)
 
     # Model construction
@@ -51,7 +51,7 @@ if __name__ == '__main__':
     Path(os.environ.get('TRAIN_TF_EVENTS_PATH')).mkdir(parents=True, exist_ok=True)
     log_file = open(Path(os.environ.get('TRAIN_LOG_PATH'), 'train.log'), 'w')
     writer = SummaryWriter(os.environ.get('TRAIN_TF_EVENTS_PATH'))
-    # global dataset
+    
     data_path = os.environ.get('TRAIN_DATA_PATH')
 
     args = get_args()
@@ -74,7 +74,6 @@ if __name__ == '__main__':
         except Exception:
             pass
 
-    # Note: RoPE doesn't require weight initialization like absolute positional encoding
     model.item_emb.weight.data[0, :] = 0
     model.user_emb.weight.data[0, :] = 0
     for k in model.sparse_emb:
@@ -98,22 +97,25 @@ if __name__ == '__main__':
     t0 = time.time()
     global_step = 0
     print("Start training")
+    
     for epoch in range(epoch_start_idx, args.num_epochs + 1):
         model.train()
         if args.inference_only: 
             break
         
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}"):
-            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
+            # 解包时间戳
+            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, timestamps = batch
             
-            
-            
+            # 调用模型forward，传入时间戳
             log_feats, pos_embs, neg_embs, loss_mask = model(
-                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                seq, pos, neg, token_type, next_token_type, next_action_type, 
+                seq_feat, pos_feat, neg_feat, timestamps=timestamps
             )
             
-            loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask,writer)
+            loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask, writer)
             optimizer.zero_grad()
+            
             # L2 regularization on item embeddings
             for param in model.item_emb.parameters():
                 loss += args.l2_emb * torch.norm(param)
@@ -136,13 +138,14 @@ if __name__ == '__main__':
         valid_loss_sum = 0
         with torch.no_grad():
             for step, batch in tqdm(enumerate(valid_loader), total=len(valid_loader), desc="Validating"):
-                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
+                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, timestamps = batch
                 
                 log_feats, pos_embs, neg_embs, loss_mask = model(
-                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                    seq, pos, neg, token_type, next_token_type, next_action_type, 
+                    seq_feat, pos_feat, neg_feat, timestamps=timestamps
                 )
                 
-                loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask,writer)
+                loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask, writer)
                 valid_loss_sum += loss.item()
         
         valid_loss = valid_loss_sum / len(valid_loader)
