@@ -6,86 +6,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+from dataset import TemporalFeatureExtractor
 
 from dataset import save_emb
-
-# 
-class TemporalFeatureExtractor:
-    """时间特征提取器"""
-    
-    @staticmethod
-    def extract_time_features(timestamps):
-        """从时间戳提取多种时间特征"""
-        if isinstance(timestamps, (int, float)):
-            timestamps = [timestamps]   # ✅ 兼容单个值
-        
-        time_features = {}
-        for i, ts in enumerate(timestamps):
-            if ts is None:
-                time_features[i] = {
-                    'hour': 0, 'day_of_week': 0, 'day_of_month': 0, 
-                    'month': 0, 'is_weekend': 0,
-                    'time_of_day_sin': 0.0, 'time_of_day_cos': 1.0,
-                    'day_of_week_sin': 0.0, 'day_of_week_cos': 1.0,
-                    'month_sin': 0.0, 'month_cos': 1.0
-                }
-                continue
-
-            dt = datetime.fromtimestamp(ts)
-            hour = dt.hour
-            day_of_week = dt.weekday()
-            day_of_month = dt.day
-            month = dt.month
-            is_weekend = 1 if day_of_week >= 5 else 0
-
-            # 周期性编码
-            time_of_day_sin = math.sin(2 * math.pi * hour / 24)
-            time_of_day_cos = math.cos(2 * math.pi * hour / 24)
-            day_of_week_sin = math.sin(2 * math.pi * day_of_week / 7)
-            day_of_week_cos = math.cos(2 * math.pi * day_of_week / 7)
-            month_sin = math.sin(2 * math.pi * month / 12)
-            month_cos = math.cos(2 * math.pi * month / 12)
-
-            time_features[i] = {
-                'hour': hour,
-                'day_of_week': day_of_week,
-                'day_of_month': day_of_month,
-                'month': month,
-                'is_weekend': is_weekend,
-                'time_of_day_sin': time_of_day_sin,
-                'time_of_day_cos': time_of_day_cos,
-                'day_of_week_sin': day_of_week_sin,
-                'day_of_week_cos': day_of_week_cos,
-                'month_sin': month_sin,
-                'month_cos': month_cos
-            }
-        return time_features
-    
-    @staticmethod
-    def extract_relative_time_features(timestamps):
-        """提取相对时间特征"""
-        relative_features = {}
-        if isinstance(timestamps, (int, float)):
-            timestamps = [timestamps]   # 兼容单个值
-        
-        for i in range(len(timestamps)):
-            if i == 0 or timestamps[i] is None or timestamps[i-1] is None:
-                relative_features[i] = {
-                    'time_since_last': 0.0,
-                    'time_since_last_log': 0.0,
-                    'time_since_last_hours': 0.0
-                }
-            else:
-                time_diff = timestamps[i] - timestamps[i-1]
-                relative_features[i] = {
-                    'time_since_last': float(time_diff),
-                    'time_since_last_log': math.log(max(1, time_diff)),
-                    'time_since_last_hours': time_diff / 3600.0
-                }
-        return relative_features
-
-
-
 class TemporalSENet(torch.nn.Module):
     """融合时间特征的SENet模块"""
     def __init__(self, hidden_units, reduction_ratio=16):
@@ -376,9 +299,15 @@ class BaselineModel(torch.nn.Module):
             if current_ts is not None:
                 time_feats = self.temporal_extractor.extract_time_features(current_ts)
                 if timestamps is not None:
-                    relative_feats = torch.stack([
-                        self.temporal_extractor.extract_relative_time_features(ts) for ts in timestamps
-                    ])
+                    temporal_features = None
+                    if timestamps is not None and len(timestamps) > 0:
+                        current_ts = timestamps[-1]
+                        if current_ts is not None:
+                            time_feats = self.temporal_extractor.extract_time_features([current_ts])
+                            relative_feats = self.temporal_extractor.extract_relative_time_features(timestamps)
+                            temporal_features = {}
+                            temporal_features.update(time_feats[0])
+                            temporal_features.update(relative_feats[len(timestamps) - 1])
                 else:
                     relative_feats = torch.zeros(seq.shape[0], self.hidden_units).to(seq.device)
 
