@@ -18,7 +18,6 @@ class TemporalFeatureExtractor:
     def extract_time_features(timestamps):
         """从时间戳提取多种时间特征"""
         time_features = {}
-        
         for i, ts in enumerate(timestamps):
             if ts is None:
                 time_features[i] = {
