@@ -2,8 +2,6 @@ import json
 import pickle
 import struct
 from pathlib import Path
-from datetime import datetime
-import math
 
 import numpy as np
 import pandas as pd
@@ -11,86 +9,7 @@ import torch
 from tqdm import tqdm
 
 
-class TemporalFeatureExtractor:
-    """时间特征提取器 - 与model.py保持一致"""
-    
-    @staticmethod
-    def extract_time_features(timestamps):
-        """从时间戳提取多种时间特征"""
-        time_features = {}
-        for i, ts in enumerate(timestamps):
-            if ts is None:
-                time_features[i] = {
-                    'hour': 0, 'day_of_week': 0, 'day_of_month': 0, 
-                    'month': 0, 'is_weekend': 0,
-                    'time_of_day_sin': 0.0, 'time_of_day_cos': 1.0,
-                    'day_of_week_sin': 0.0, 'day_of_week_cos': 1.0,
-                    'month_sin': 0.0, 'month_cos': 1.0
-                }
-                continue
-                
-            dt = datetime.fromtimestamp(ts)
-            
-            hour = dt.hour
-            day_of_week = dt.weekday()
-            day_of_month = dt.day
-            month = dt.month
-            is_weekend = 1 if day_of_week >= 5 else 0
-            
-            # 周期性编码
-            time_of_day_sin = math.sin(2 * math.pi * hour / 24)
-            time_of_day_cos = math.cos(2 * math.pi * hour / 24)
-            day_of_week_sin = math.sin(2 * math.pi * day_of_week / 7)
-            day_of_week_cos = math.cos(2 * math.pi * day_of_week / 7)
-            month_sin = math.sin(2 * math.pi * month / 12)
-            month_cos = math.cos(2 * math.pi * month / 12)
-            
-            time_features[i] = {
-                'hour': hour,
-                'day_of_week': day_of_week,
-                'day_of_month': day_of_month,
-                'month': month,
-                'is_weekend': is_weekend,
-                'time_of_day_sin': time_of_day_sin,
-                'time_of_day_cos': time_of_day_cos,
-                'day_of_week_sin': day_of_week_sin,
-                'day_of_week_cos': day_of_week_cos,
-                'month_sin': month_sin,
-                'month_cos': month_cos
-            }
-        
-        return time_features
-    
-    @staticmethod
-    def extract_relative_time_features(timestamps):
-        """提取相对时间特征"""
-        relative_features = {}
-        
-        for i in range(len(timestamps)):
-            if i == 0 or timestamps[i] is None or timestamps[i-1] is None:
-                relative_features[i] = {
-                    'time_since_last': 0.0,
-                    'time_since_last_log': 0.0,
-                    'time_since_last_hours': 0.0
-                }
-            else:
-                time_diff = timestamps[i] - timestamps[i-1]
-                time_since_last = float(time_diff)
-                time_since_last_log = math.log(max(1, time_diff))
-                time_since_last_hours = time_diff / 3600.0
-                
-                relative_features[i] = {
-                    'time_since_last': time_since_last,
-                    'time_since_last_log': time_since_last_log,
-                    'time_since_last_hours': time_since_last_hours
-                }
-        
-        return relative_features
-
-
 class MyDataset(torch.utils.data.Dataset):
-    """用户序列数据集 - 增强时间特征支持"""
-
     def __init__(self, data_dir, args):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -108,11 +27,8 @@ class MyDataset(torch.utils.data.Dataset):
         self.indexer_u_rev = {v: k for k, v in indexer['u'].items()}
         self.indexer = indexer
 
-        # 时间特征提取器
-        self.temporal_extractor = TemporalFeatureExtractor()
-        
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
-
+        print("usernum:", self.usernum, "itemnum:", self.itemnum)
     def _load_data_and_offsets(self):
         self.data_file_path = self.data_dir / "seq.jsonl"
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
@@ -122,16 +38,15 @@ class MyDataset(torch.utils.data.Dataset):
     def _load_user_data(self, uid):
         if not hasattr(self, 'data_file') or self.data_file is None:
             self.data_file = open(self.data_file_path, 'rb')
-        
         self.data_file.seek(self.seq_offsets[uid])
         line = self.data_file.readline()
         data = json.loads(line)
         return data
-    
+
     def _init_worker(self, worker_id):
         if hasattr(self, 'data_file'):
             self.data_file = None
-    
+
     def __del__(self):
         if hasattr(self, 'data_file') and self.data_file is not None:
             self.data_file.close()
@@ -142,79 +57,38 @@ class MyDataset(torch.utils.data.Dataset):
             t = np.random.randint(l, r)
         return t
 
-    def _add_enhanced_time_features(self, user_sequence, tau=86400):
-        """增强的时间特征提取，集成绝对时间和相对时间特征"""
+    def _add_time_features(self, user_sequence):
         if not user_sequence:
-            return user_sequence, []
+            return user_sequence
 
-        # 提取所有时间戳
-        timestamps = [r[5] for r in user_sequence]
-        
-        # 提取绝对时间特征
-        time_features = self.temporal_extractor.extract_time_features(timestamps)
-        
-        # 提取相对时间特征
-        relative_features = self.temporal_extractor.extract_relative_time_features(timestamps)
-
-        # 计算额外的时间衰减特征（保持原有逻辑）
-        ts_array = np.array(timestamps, dtype=np.int64)
-        
-        # 原有的time_gap和log_gap逻辑
+        ts_array = np.array([r[5] for r in user_sequence], dtype=np.int64)
         prev_ts_array = np.roll(ts_array, 1)
         prev_ts_array[0] = ts_array[0]
         time_gap = ts_array - prev_ts_array
         time_gap[0] = 0
         log_gap = np.log1p(time_gap)
 
-        # UTC+8时区转换
         ts_utc8 = ts_array + 8 * 3600
         hours = (ts_utc8 % 86400) // 3600
         weekdays = ((ts_utc8 // 86400) + 4) % 7
         months = pd.to_datetime(ts_utc8, unit='s').month.to_numpy()
 
-        # 时间衰减
         last_ts = ts_array[-1]
         delta_t = last_ts - ts_array
-        delta_scaled = np.log1p(delta_t / tau)
+        delta_scaled = np.log1p(delta_t / 86400)
 
-        # 将时间特征添加到序列中
         new_sequence = []
         for idx, record in enumerate(user_sequence):
             u, i, user_feat, item_feat, action_type, ts = record
-            
-            if user_feat is None:
-                user_feat = {}
-
-            # 原有时间特征（保持兼容性）
-            user_feat["200"] = int(hours[idx])
-            user_feat["201"] = int(weekdays[idx])
-            user_feat["202"] = float(log_gap[idx])
-            user_feat["203"] = int(months[idx])
-            user_feat["204"] = float(delta_scaled[idx])
-            
-            # 新增的增强时间特征
-            if idx in time_features:
-                tf = time_features[idx]
-                user_feat["210"] = tf['hour']  # 重复但保持一致性
-                user_feat["211"] = tf['day_of_week']
-                user_feat["212"] = tf['month']
-                user_feat["213"] = tf['is_weekend']
-                user_feat["214"] = tf['time_of_day_sin']
-                user_feat["215"] = tf['time_of_day_cos']
-                user_feat["216"] = tf['day_of_week_sin']
-                user_feat["217"] = tf['day_of_week_cos']
-                user_feat["218"] = tf['month_sin']
-                user_feat["219"] = tf['month_cos']
-            
-            if idx in relative_features:
-                rf = relative_features[idx]
-                user_feat["220"] = rf['time_since_last']
-                user_feat["221"] = rf['time_since_last_log']
-                user_feat["222"] = rf['time_since_last_hours']
-
+            if item_feat is None:
+                item_feat = {}
+            item_feat["200"] = int(hours[idx])
+            item_feat["201"] = int(weekdays[idx])
+            item_feat["202"] = float(log_gap[idx])
+            item_feat["203"] = int(months[idx])
+            item_feat["204"] = float(delta_scaled[idx])
             new_sequence.append((u, i, user_feat, item_feat, action_type, ts))
-            
-        return new_sequence, timestamps
+        return new_sequence
 
     def _features_to_tensors(self, feat_array):
         feature_tensors = {}
@@ -244,7 +118,7 @@ class MyDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, uid):
         user_sequence = self._load_user_data(uid)
-        user_sequence, timestamps = self._add_enhanced_time_features(user_sequence)
+        user_sequence = self._add_time_features(user_sequence)
 
         ext_user_sequence = []
         for record_tuple in user_sequence:
@@ -264,31 +138,21 @@ class MyDataset(torch.utils.data.Dataset):
         seq_feat = [self.feature_default_value] * (self.maxlen + 1)
         pos_feat = [self.feature_default_value] * (self.maxlen + 1)
         neg_feat = [self.feature_default_value] * (self.maxlen + 1)
-        seq_timestamps = [None] * (self.maxlen + 1)  # 新增：存储时间戳
 
         nxt = ext_user_sequence[-1]
         idx = self.maxlen
-
         ts = {record[0] for record in ext_user_sequence if record[2] == 1 and record[0]}
-
-        # 构建时间戳序列
-        timestamp_idx = len(timestamps) - 1
 
         for record_tuple in reversed(ext_user_sequence[:-1]):
             i, feat, type_, act_type = record_tuple
             next_i, next_feat, next_type, next_act_type = nxt
-            
+
             seq[idx] = i
             token_type[idx] = type_
             next_token_type[idx] = next_type
             if next_act_type is not None:
                 next_action_type[idx] = next_act_type
             seq_feat[idx] = self.fill_missing_feat(feat, i)
-            
-            # 设置对应的时间戳
-            if timestamp_idx >= 0 and timestamp_idx < len(timestamps):
-                seq_timestamps[idx] = timestamps[timestamp_idx]
-                timestamp_idx -= 1
 
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
@@ -306,7 +170,7 @@ class MyDataset(torch.utils.data.Dataset):
         pos_feat_tensors = self._features_to_tensors(pos_feat)
         neg_feat_tensors = self._features_to_tensors(neg_feat)
 
-        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat_tensors, pos_feat_tensors, neg_feat_tensors, seq_timestamps
+        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat_tensors, pos_feat_tensors, neg_feat_tensors
 
     def __len__(self):
         return len(self.seq_offsets)
@@ -315,48 +179,47 @@ class MyDataset(torch.utils.data.Dataset):
         feat_default_value = {}
         feat_statistics = {}
         feat_types = {}
+
+        # 多模态 embedding 维度
         EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
 
-        feat_types['user_sparse'] = ['103', '104', '105', '109']
-        feat_types['item_sparse'] = [
-            '100', '117', '111', '118', '101', '102', '119', '120', '114', '112', '121', '115', '122', '116',
+        # 特征分类
+        feat_types['user_sparse']  = ['103', '104', '105', '109']
+        feat_types['item_sparse']  = [
+            '100', '117', '111', '118', '101', '102', '119', '120', '114', '112', '121',
+            '115', '122', '116', '200', '201', '203'
         ]
-        feat_types['item_array'] = []
-        feat_types['user_array'] = ['106', '107', '108', '110']
-        feat_types['item_emb'] = self.mm_emb_ids
-        feat_types['user_continual'] = []
-        feat_types['item_continual'] = []
-        
-        # 添加原有时间特征
-        feat_types['user_sparse'].extend(['200', '201', '203'])  # hour, weekday, month
-        feat_types['user_continual'].extend(['202', '204'])  # log_gap, delta_scaled
-        
-        # 添加新的增强时间特征
-        feat_types['user_sparse'].extend(['210', '211', '212', '213'])  # hour, day_of_week, month, is_weekend
-        feat_types['user_continual'].extend(['214', '215', '216', '217', '218', '219'])  # sin/cos features
-        feat_types['user_continual'].extend(['220', '221', '222'])  # relative time features
+        feat_types['item_array']   = []
+        feat_types['user_array']   = ['106', '107', '108', '110']
+        feat_types['item_emb']     = self.mm_emb_ids
+        feat_types['user_continual']  = []
+        feat_types['item_continual']  = ['202', '204']
 
-        # 设置特征统计和默认值
+        # 固定时间特征的 vocab_size（不依赖 indexer）
+        fixed_vocab_size = {
+            '200': 24,  # hour 0~23
+            '201': 7,   # weekday 0~6
+            '203': 13,  # month 1~12（0 作为 padding）
+        }
+
+        # 初始化 sparse 特征
         for feat_id in feat_types['user_sparse'] + feat_types['item_sparse']:
             feat_default_value[feat_id] = 0
-            if feat_id in ['200', '210']:  # hour
-                feat_statistics[feat_id] = 24
-            elif feat_id in ['201', '211']:  # day_of_week
-                feat_statistics[feat_id] = 7
-            elif feat_id in ['203', '212']:  # month
-                feat_statistics[feat_id] = 12
-            elif feat_id in ['213']:  # is_weekend
-                feat_statistics[feat_id] = 2
+            if feat_id in fixed_vocab_size:
+                feat_statistics[feat_id] = fixed_vocab_size[feat_id]
             else:
                 feat_statistics[feat_id] = len(self.indexer['f'].get(feat_id, {}))
-                
+
+        # 初始化 array 特征
         for feat_id in feat_types['item_array'] + feat_types['user_array']:
             feat_default_value[feat_id] = [0]
             feat_statistics[feat_id] = len(self.indexer['f'].get(feat_id, {}))
-            
+
+        # 初始化 continual 特征
         for feat_id in feat_types['user_continual'] + feat_types['item_continual']:
             feat_default_value[feat_id] = 0.0
-            
+
+        # 初始化多模态 embedding 特征
         for feat_id in feat_types['item_emb']:
             shape = EMB_SHAPE_DICT[feat_id]
             feat_default_value[feat_id] = np.zeros(shape, dtype=np.float32)
@@ -366,13 +229,10 @@ class MyDataset(torch.utils.data.Dataset):
 
     def fill_missing_feat(self, feat, item_id):
         filled_feat = {} if feat is None else feat.copy()
-        
         all_feat_ids = [fid for f_list in self.feature_types.values() for fid in f_list]
-        
         for feat_id in all_feat_ids:
             if feat_id not in filled_feat:
                 filled_feat[feat_id] = self.feature_default_value[feat_id]
-        
         for feat_id in self.feature_types['item_emb']:
             if item_id != 0:
                 creative_id = self.indexer_i_rev.get(item_id)
@@ -381,24 +241,22 @@ class MyDataset(torch.utils.data.Dataset):
                     if isinstance(emb, list):
                         emb = np.array(emb, dtype=np.float32)
                     filled_feat[feat_id] = emb
-
         return filled_feat
 
     @staticmethod
     def collate_fn(batch):
-        # 解包时间戳
-        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, timestamps = zip(*batch)
-        
+        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = zip(*batch)
         seq = torch.from_numpy(np.array(seq))
         pos = torch.from_numpy(np.array(pos))
         neg = torch.from_numpy(np.array(neg))
         token_type = torch.from_numpy(np.array(token_type))
         next_token_type = torch.from_numpy(np.array(next_token_type))
         next_action_type = torch.from_numpy(np.array(next_action_type))
-        
+
         def batch_features(feat_list):
             batched_feat = {}
-            if not feat_list: return batched_feat
+            if not feat_list:
+                return batched_feat
             all_keys = feat_list[0].keys()
             for k in all_keys:
                 if isinstance(feat_list[0][k], torch.Tensor):
@@ -409,11 +267,9 @@ class MyDataset(torch.utils.data.Dataset):
                         for item_list in d[k]:
                             if isinstance(item_list, list):
                                 max_len = max(max_len, len(item_list))
-                    
                     batch_size = len(feat_list)
                     seq_len = len(feat_list[0][k])
                     padded_batch = torch.zeros((batch_size, seq_len, max_len), dtype=torch.long)
-                    
                     for i, d in enumerate(feat_list):
                         for j, item_list in enumerate(d[k]):
                             if isinstance(item_list, list):
@@ -426,7 +282,7 @@ class MyDataset(torch.utils.data.Dataset):
         batched_pos_feat = batch_features(pos_feat)
         batched_neg_feat = batch_features(neg_feat)
 
-        return seq, pos, neg, token_type, next_token_type, next_action_type, batched_seq_feat, batched_pos_feat, batched_neg_feat, list(timestamps)
+        return seq, pos, neg, token_type, next_token_type, next_action_type, batched_seq_feat, batched_pos_feat, batched_neg_feat
 
 
 class MyTestDataset(MyDataset):
@@ -451,8 +307,8 @@ class MyTestDataset(MyDataset):
 
     def __getitem__(self, uid):
         user_sequence = self._load_user_data(uid)
-        user_sequence, timestamps = self._add_enhanced_time_features(user_sequence)
-        
+        user_sequence = self._add_time_features(user_sequence)
+
         user_id = ""
         ext_user_sequence = []
         for record_tuple in user_sequence:
@@ -469,28 +325,19 @@ class MyTestDataset(MyDataset):
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
         seq_feat = [self.feature_default_value] * (self.maxlen + 1)
-        seq_timestamps = [None] * (self.maxlen + 1)  # 新增：时间戳序列
-        
+
         idx = self.maxlen
-        timestamp_idx = len(timestamps) - 1
-        
         for record_tuple in reversed(ext_user_sequence):
-            if idx < 0: break
+            if idx < 0:
+                break
             i, feat, type_ = record_tuple
             seq[idx] = i
             token_type[idx] = type_
             seq_feat[idx] = self.fill_missing_feat(feat, i)
-            
-            # 设置时间戳
-            if timestamp_idx >= 0 and timestamp_idx < len(timestamps):
-                seq_timestamps[idx] = timestamps[timestamp_idx]
-                timestamp_idx -= 1
-                
             idx -= 1
 
         seq_feat_tensors = self._features_to_tensors(seq_feat)
-
-        return seq, token_type, seq_feat_tensors, user_id, seq_timestamps
+        return seq, token_type, seq_feat_tensors, user_id
 
     def __len__(self):
         with open(Path(self.data_dir, 'predict_seq_offsets.pkl'), 'rb') as f:
@@ -499,13 +346,14 @@ class MyTestDataset(MyDataset):
 
     @staticmethod
     def collate_fn(batch):
-        seq, token_type, seq_feat, user_id, timestamps = zip(*batch)
+        seq, token_type, seq_feat, user_id = zip(*batch)
         seq = torch.from_numpy(np.array(seq))
         token_type = torch.from_numpy(np.array(token_type))
-        
+
         def batch_features(feat_list):
             batched_feat = {}
-            if not feat_list: return batched_feat
+            if not feat_list:
+                return batched_feat
             all_keys = feat_list[0].keys()
             for k in all_keys:
                 if isinstance(feat_list[0][k], torch.Tensor):
@@ -516,11 +364,9 @@ class MyTestDataset(MyDataset):
                         for item_list in d[k]:
                             if isinstance(item_list, list):
                                 max_len = max(max_len, len(item_list))
-                    
                     batch_size = len(feat_list)
                     seq_len = len(feat_list[0][k])
                     padded_batch = torch.zeros((batch_size, seq_len, max_len), dtype=torch.long)
-                    
                     for i, d in enumerate(feat_list):
                         for j, item_list in enumerate(d[k]):
                             if isinstance(item_list, list):
@@ -528,9 +374,9 @@ class MyTestDataset(MyDataset):
                                 padded_batch[i, j, :trunc_len] = torch.tensor(item_list[:trunc_len], dtype=torch.long)
                     batched_feat[k] = padded_batch
             return batched_feat
-        
+
         batched_seq_feat = batch_features(seq_feat)
-        return seq, token_type, batched_seq_feat, user_id, list(timestamps)
+        return seq, token_type, batched_seq_feat, user_id
 
 
 def save_emb(emb, save_path):

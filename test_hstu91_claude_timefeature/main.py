@@ -1,3 +1,4 @@
+
 import argparse
 import json
 import os
@@ -105,12 +106,12 @@ if __name__ == '__main__':
         
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}"):
             # 解包时间戳
-            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, timestamps = batch
+            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
             
             # 调用模型forward，传入时间戳
             log_feats, pos_embs, neg_embs, loss_mask = model(
                 seq, pos, neg, token_type, next_token_type, next_action_type, 
-                seq_feat, pos_feat, neg_feat, timestamps=timestamps
+                seq_feat, pos_feat, neg_feat
             )
             
             loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask, writer)
@@ -138,11 +139,11 @@ if __name__ == '__main__':
         valid_loss_sum = 0
         with torch.no_grad():
             for step, batch in tqdm(enumerate(valid_loader), total=len(valid_loader), desc="Validating"):
-                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, timestamps = batch
+                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
                 
                 log_feats, pos_embs, neg_embs, loss_mask = model(
                     seq, pos, neg, token_type, next_token_type, next_action_type, 
-                    seq_feat, pos_feat, neg_feat, timestamps=timestamps
+                    seq_feat, pos_feat, neg_feat
                 )
                 
                 loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask, writer)
