@@ -9,34 +9,6 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-
-def load_mm_emb(mm_path, feat_ids):
-    SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
-    mm_emb_dict = {}
-    for feat_id in tqdm(feat_ids, desc='Loading mm_emb'):
-        shape = SHAPE_DICT[feat_id]
-        emb_dict = {}
-        if feat_id != '81':
-            try:
-                base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
-                for json_file in base_path.glob('*.json'):
-                    with open(json_file, 'r', encoding='utf-8') as file:
-                        for line in file:
-                            data = json.loads(line.strip())
-                            emb = data['emb']
-                            if isinstance(emb, list):
-                                emb = np.array(emb, dtype=np.float32)
-                            emb_dict[data['anonymous_cid']] = emb
-            except Exception as e:
-                print(f"transfer error: {e}")
-        else:
-            with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
-                emb_dict = pickle.load(f)
-        mm_emb_dict[feat_id] = emb_dict
-        print(f'Loaded #{feat_id} mm_emb')
-    return mm_emb_dict
-
-
 class MyDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir, args):
         super().__init__()
@@ -369,7 +341,7 @@ class MyTestDataset(MyDataset):
 
     def __getitem__(self, uid):
         user_sequence = self._load_user_data(uid)
-        ts,user_sequence = self._add_time_features(user_sequence)
+        user_sequence = self._add_time_features(user_sequence)
 
         user_id = ""
         ext_user_sequence = []

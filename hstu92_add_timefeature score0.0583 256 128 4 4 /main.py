@@ -21,7 +21,7 @@ def get_args():
     parser.add_argument('--batch_size', default=256, type=int)
     parser.add_argument('--lr', default=0.002, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
-    parser.add_argument('--num_epochs', default=5, type=int)
+    parser.add_argument('--num_epochs', default=8, type=int)
     parser.add_argument('--num_workers', default=4, type=int)
 
     # Model construction
