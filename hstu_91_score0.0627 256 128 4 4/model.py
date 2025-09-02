@@ -1,11 +1,10 @@
 from pathlib import Path
 import math
-
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-
 from dataset import save_emb
 
 
@@ -251,7 +250,7 @@ class BaselineModel(torch.nn.Module):
         pos_embs = self.feat2emb(pos_seqs, pos_feat, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feat, include_user=False)
         return log_feats, pos_embs, neg_embs, loss_mask
-    
+
     def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask, writer):
         hidden_size = neg_embs.size(-1)
         
@@ -306,7 +305,7 @@ class BaselineModel(torch.nn.Module):
                     item_feat_tensors[k] = torch.tensor(data, dtype=torch.long).unsqueeze(0)
 
             batch_emb = self.feat2emb(item_seq, item_feat_tensors, include_user=False).squeeze(0)
-            batch_emb = F.normalize(batch_emb, p=2, dim=-1) # L2 Normalization for consistency
+            batch_emb = F.normalize(batch_emb, p=2, dim=-1)
             all_embs.append(batch_emb.detach().cpu().numpy().astype(np.float32))
 
         final_ids = np.array(retrieval_ids, dtype=np.uint64).reshape(-1, 1)

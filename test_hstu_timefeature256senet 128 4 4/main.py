@@ -20,7 +20,6 @@ def get_args():
 
     # Train params
     parser.add_argument('--batch_size', default=256, type=int)
-    parser.add_argument('--lr', default=0.002, type=float)          # 不再使用，仅保留兼容
     parser.add_argument('--maxlen', default=101, type=int)
     parser.add_argument('--num_epochs', default=5, type=int)
     parser.add_argument('--num_workers', default=4, type=int)
@@ -29,8 +28,12 @@ def get_args():
     parser.add_argument('--hidden_units', default=128, type=int)
     parser.add_argument('--num_blocks', default=4, type=int)
     parser.add_argument('--num_heads', default=4, type=int)
+    
+    # === 修改：新增分层dropout参数 ===
     parser.add_argument('--emb_dropout_rate', default=0.3, type=float, help='Dropout rate for embeddings')
-    parser.add_argument('--transformer_dropout_rate', default=0.1, type=float, help='Dropout rate for transformer layers')
+    parser.add_argument('--fusion_dropout_rate', default=0.2, type=float, help='Dropout rate for fusion layer')
+    parser.add_argument('--ffn_dropout_rate', default=0.1, type=float, help='Dropout rate for FFN layers')
+    
     parser.add_argument('--l2_emb', default=0.0, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
@@ -38,7 +41,7 @@ def get_args():
     parser.add_argument('--norm_first', action='store_true')
 
     # InfoNCE Loss and Optimizer Params
-    parser.add_argument('--temperature', default=0.03, type=float, help='Temperature for InfoNCE loss')
+    parser.add_argument('--temperature', default=0.035, type=float, help='Temperature for InfoNCE loss')
     parser.add_argument('--weight_decay', default=0.01, type=float, help='Weight decay for AdamW optimizer')
 
     # MMemb Feature ID
@@ -57,6 +60,13 @@ if __name__ == '__main__':
     data_path = os.environ.get('TRAIN_DATA_PATH')
 
     args = get_args()
+    
+    # === 添加：打印配置信息 ===
+    print("=== Model Configuration ===")
+    print(f"Embedding dropout rate: {args.emb_dropout_rate}")
+    print(f"Fusion dropout rate: {args.fusion_dropout_rate}")
+    print(f"FFN dropout rate: {args.ffn_dropout_rate}")
+    
     dataset = MyDataset(data_path, args)
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.99, 0.01])
     train_loader = DataLoader(
