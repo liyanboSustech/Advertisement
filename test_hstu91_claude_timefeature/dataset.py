@@ -107,6 +107,10 @@ class MyDataset(torch.utils.data.Dataset):
 
         # time decay
         last_ts = ts_array[-1]
+        # delta_t是时间差
+        # delta_scaled是时间差经过log1p和归一化后的结果
+        # delta_scaled是什么样子呢？
+        # 
         delta_t = last_ts - ts_array
         delta_scaled = np.log1p(delta_t / tau)
 
@@ -123,7 +127,7 @@ class MyDataset(torch.utils.data.Dataset):
             user_feat["204"] = int(months[idx])
             user_feat["205"] = float(delta_scaled[idx])
             new_sequence.append((u, i, user_feat, item_feat, action_type, ts))
-        return new_sequence  # 小红书号：3893367512
+        return ts_array, new_sequence 
 
     def _features_to_tensors(self, feat_array):
         feature_tensors = {}
@@ -156,16 +160,18 @@ class MyDataset(torch.utils.data.Dataset):
     # =================================================================
     def __getitem__(self, uid):
         user_sequence = self._load_user_data(uid)
-        user_sequence = self._add_time_features(user_sequence)
-
+        # 
+        ts_array,user_sequence = self._add_time_features(user_sequence)
+        # user_seq
         ext_user_sequence = []
         for record_tuple in user_sequence:
             u, i, user_feat, item_feat, action_type, _ = record_tuple
             if u and user_feat:
                 ext_user_sequence.insert(0, (u, user_feat, 2, action_type))
+                # insert得到的格式是 (id, feat, type, action_type)，type=2表示user
             if i and item_feat:
                 ext_user_sequence.append((i, item_feat, 1, action_type))
-
+        # ext_user_sequence 中每条记录格式为 (id, feat, type, action_type)，type=1表示item，type=2表示user
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         pos = np.zeros([self.maxlen + 1], dtype=np.int32)
         neg = np.zeros([self.maxlen + 1], dtype=np.int32)
@@ -179,24 +185,31 @@ class MyDataset(torch.utils.data.Dataset):
 
         nxt = ext_user_sequence[-1]
         idx = self.maxlen
+        # ext_user_sequence的格式是 (id, feat, type, action_type)
+        # type = 1 表示 item, type = 2 表示 user
+        
         ts = {record[0] for record in ext_user_sequence if record[2] == 1 and record[0]}
-
         # -------------------------------------------------------------
         #  以下 for-loop 完全按照图 4 手写逻辑重写
         # -------------------------------------------------------------
         for record_tuple in reversed(ext_user_sequence[:-1]):
-            # 当前 token 信息
-            i, u_feat, i_feat, type_, act_type = record_tuple
+            # 1. 拆包当前 token
+            i, feat_dict, type_, act_type = record_tuple
+            # 2. 我们只关心 item token（type==1）
             if type_ == 2:
                 continue
-            # 把 user_feat 中的上下文特征转移到 item_feat
-            i_feat = self._transfer_context_features(
-                u_feat, i_feat, ["200", "201", "203", "204"])
-            i_feat = self.fill_missing_feat(i_feat, i)
-
-            # 下一个 token 信息
-            next_i, _, next_feat, next_type, next_act_type = nxt
+            # 3. 取出“紧邻的前一条 token”（倒序遍历时它就是 nxt）
+            next_i, next_feat, next_type, next_act_type = nxt
+            # 4. 如果前一条是 user token，则 prev_feat_dict 就是 u_feat
             next_feat = self.fill_missing_feat(next_feat, next_i)
+            if next_type == 2:
+                u_feat = next_feat          # 真正的 user_feat
+            else:
+                u_feat = {}                      # 没有可用的 user token
+            # 5. 当前 item 的原始特征就是 feat_dict
+            i_feat = self.fill_missing_feat(feat_dict, i)
+            i_feat = self._transfer_context_features(
+                u_feat, i_feat, ["200", "201", "203", "204", "205"])
 
             seq[idx] = i
             seq_feat[idx] = i_feat
@@ -238,15 +251,15 @@ class MyDataset(torch.utils.data.Dataset):
         feat_types['user_sparse'] = ['103', '104', '105', '109']
         feat_types['item_sparse'] = [
             '100', '117', '111', '118', '101', '102', '119', '120', '114', '112', '121',
-            '115', '122', '116', '200', '201', '203'
+            '115', '122', '116', '200', '201', '204'
         ]
         feat_types['item_array'] = []
         feat_types['user_array'] = ['106', '107', '108', '110']
         feat_types['item_emb'] = self.mm_emb_ids
         feat_types['user_continual'] = []
-        feat_types['item_continual'] = ['202', '204']
+        feat_types['item_continual'] = ['203', '205']
 
-        fixed_vocab_size = {'200': 24, '201': 7, '203': 13}
+        fixed_vocab_size = {'200': 24, '201': 7, '204': 13}
 
         for feat_id in feat_types['user_sparse'] + feat_types['item_sparse']:
             feat_default_value[feat_id] = 0
@@ -289,7 +302,8 @@ class MyDataset(torch.utils.data.Dataset):
     def _transfer_context_features(self, user_feat: dict, item_feat: dict, cols_to_trans: list):
         """把 user_feat 中指定列的值直接赋给 item_feat"""
         for col in cols_to_trans:
-            item_feat[col] = user_feat[col]
+            if col in user_feat:          # 先检查
+                item_feat[col] = user_feat[col]
         return item_feat
 
     @staticmethod
@@ -355,7 +369,7 @@ class MyTestDataset(MyDataset):
 
     def __getitem__(self, uid):
         user_sequence = self._load_user_data(uid)
-        user_sequence = self._add_time_features(user_sequence)
+        ts,user_sequence = self._add_time_features(user_sequence)
 
         user_id = ""
         ext_user_sequence = []
