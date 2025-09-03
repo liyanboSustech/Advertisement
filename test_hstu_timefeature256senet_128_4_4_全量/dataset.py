@@ -341,7 +341,7 @@ class MyTestDataset(MyDataset):
 
     def __getitem__(self, uid):
         user_sequence = self._load_user_data(uid)
-        user_sequence = self._add_time_features(user_sequence)
+        ts,user_sequence = self._add_time_features(user_sequence)
 
         user_id = ""
         ext_user_sequence = []
