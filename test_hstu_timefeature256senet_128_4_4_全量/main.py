@@ -30,9 +30,9 @@ def get_args():
     parser.add_argument('--num_heads', default=4, type=int)
     
     # === 修改：新增分层dropout参数 ===
-    parser.add_argument('--emb_dropout_rate', default=0.3, type=float, help='Dropout rate for embeddings')
-    parser.add_argument('--fusion_dropout_rate', default=0.2, type=float, help='Dropout rate for fusion layer')
-    parser.add_argument('--ffn_dropout_rate', default=0.1, type=float, help='Dropout rate for FFN layers')
+    parser.add_argument('--emb_dropout_rate', default=0.2, type=float, help='Dropout rate for embeddings')
+    parser.add_argument('--fusion_dropout_rate', default=0.1, type=float, help='Dropout rate for fusion layer')
+    parser.add_argument('--ffn_dropout_rate', default=0.05, type=float, help='Dropout rate for FFN layers')
     
     parser.add_argument('--l2_emb', default=0.0, type=float)
     parser.add_argument('--device', default='cuda', type=str)
@@ -68,23 +68,15 @@ if __name__ == '__main__':
     print(f"FFN dropout rate: {args.ffn_dropout_rate}")
     
     dataset = MyDataset(data_path, args)
-    train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.99, 0.01])
     train_loader = DataLoader(
-        train_dataset,
+        dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=dataset.collate_fn,
         worker_init_fn=dataset._worker_init_fn
     )
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=dataset.collate_fn,
-        worker_init_fn=dataset._worker_init_fn
-    )
+    
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
 
@@ -120,7 +112,7 @@ if __name__ == '__main__':
         2: 0.001,
         3: 0.0005,
         4: 0.0005,
-        5: 0.0025,
+        5: 0.00025,
     }
 
     best_val_ndcg, best_val_hr = 0.0, 0.0
@@ -141,15 +133,22 @@ if __name__ == '__main__':
             param_group['lr'] = lr
         print(f"Epoch {epoch} using lr = {lr}")
 
-        for step, batch in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}"):
-            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
+        
+        valid_loss_sum = 0
+        for step, batch in tqdm(enumerate(train_loader),
+                                total=len(train_loader),
+                                desc=f"Epoch {epoch}"):
+            seq, pos, neg, token_type, next_token_type, next_action_type, \
+                seq_feat, pos_feat, neg_feat = batch
 
             log_feats, pos_embs, neg_embs, loss_mask = model(
                 seq, pos, neg, token_type, next_token_type, next_action_type,
                 seq_feat, pos_feat, neg_feat
             )
 
-            loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask, writer)
+            loss = model.compute_infonce_loss(
+                log_feats, pos_embs, neg_embs, loss_mask, writer)
+            valid_loss_sum += loss.item()
             optimizer.zero_grad()
 
             for param in model.item_emb.parameters():
@@ -159,8 +158,11 @@ if __name__ == '__main__':
             optimizer.step()
 
             log_json = json.dumps(
-                {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': time.time(),'lr': lr}
-            )
+                {'global_step': global_step,
+                 'loss': loss.item(),
+                 'epoch': epoch,
+                 'time': time.time(),
+                 'lr': lr})
             log_file.write(log_json + '\n')
             log_file.flush()
             print(log_json)
@@ -168,25 +170,7 @@ if __name__ == '__main__':
             writer.add_scalar('Loss/train', loss.item(), global_step)
             global_step += 1
 
-        # Validation loop
-        model.eval()
-        valid_loss_sum = 0
-        with torch.no_grad():
-            for step, batch in tqdm(enumerate(valid_loader), total=len(valid_loader), desc="Validating"):
-                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
-
-                log_feats, pos_embs, neg_embs, loss_mask = model(
-                    seq, pos, neg, token_type, next_token_type, next_action_type,
-                    seq_feat, pos_feat, neg_feat
-                )
-
-                loss = model.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask, writer)
-                valid_loss_sum += loss.item()
-
-        valid_loss = valid_loss_sum / len(valid_loader)
-        writer.add_scalar('Loss/valid', valid_loss, global_step)
-        print(f"Epoch {epoch} validation loss: {valid_loss:.4f}")
-
+        valid_loss_sum /= len(train_loader)
         save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"global_step{global_step}.valid_loss={valid_loss_sum:.4f}")
         save_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), save_dir / "model.pt")
